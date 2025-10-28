@@ -13,11 +13,29 @@ from java.lang import Object
 from java.awt import BorderLayout, Dimension, Color, Font
 from javax.swing import (JPanel, JFrame, JTable, JScrollPane, JLabel, JTextArea,
                          JButton, JComboBox, Box, BoxLayout, SwingUtilities,
-                         JSplitPane, JTabbedPane)
-from javax.swing.table import AbstractTableModel, DefaultTableCellRenderer
+                         JSplitPane, JTabbedPane, JTextField, RowFilter)
+from javax.swing.table import AbstractTableModel, DefaultTableCellRenderer, TableRowSorter
+from javax.swing.event import DocumentListener
+import javax.swing
 import base64
 import json
 from collections import defaultdict, OrderedDict
+import re
+
+
+class FilterListener(DocumentListener):
+    """Listener to filter table rows based on text input."""
+    def __init__(self, extender):
+        self.extender = extender
+    
+    def insertUpdate(self, e):
+        self.extender._apply_filter()
+    
+    def removeUpdate(self, e):
+        self.extender._apply_filter()
+    
+    def changedUpdate(self, e):
+        self.extender._apply_filter()
 
 
 class ColorCellRenderer(DefaultTableCellRenderer):
@@ -276,10 +294,18 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab):
         """Create the matrix visualization tab."""
         matrix_panel = JPanel(BorderLayout())
 
+        # Filter panel at the top
+        filter_panel = JPanel(BorderLayout())
+        filter_panel.add(JLabel("Filter endpoints: "), BorderLayout.WEST)
+        self.filter_field = JTextField()
+        self.filter_field.getDocument().addDocumentListener(FilterListener(self))
+        filter_panel.add(self.filter_field, BorderLayout.CENTER)
+
         # matrix model & table
         self.table_model = JwtMatrixModel(self)
         self.table = JTable(self.table_model)
-        self.table.setAutoCreateRowSorter(True)
+        self.table_sorter = TableRowSorter(self.table_model)
+        self.table.setRowSorter(self.table_sorter)
         self.table.setDefaultRenderer(Object, ColorCellRenderer())  # colorize all cells
         scroll = JScrollPane(self.table)
 
@@ -309,6 +335,7 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab):
         bottom_panel.add(self.stats_label, BorderLayout.WEST)
         bottom_panel.add(legend_panel, BorderLayout.CENTER)
 
+        matrix_panel.add(filter_panel, BorderLayout.NORTH)
         matrix_panel.add(scroll, BorderLayout.CENTER)
         matrix_panel.add(bottom_panel, BorderLayout.SOUTH)
 
@@ -482,6 +509,23 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab):
                 data[ep][u] = dict(self.matrix.get(ep, {}).get(u, {}))
         self.table_model.set_matrix(endpoints, users, data)
         self.stats_label.setText("Endpoints: %d    Users: %d" % (len(endpoints), len(users)))
+        # Re-apply filter after model update
+        self._apply_filter()
+
+    def _apply_filter(self):
+        """Apply the filter to the table based on the filter text field."""
+        try:
+            filter_text = self.filter_field.getText().strip()
+            if not filter_text:
+                # No filter, show all rows
+                self.table_sorter.setRowFilter(None)
+            else:
+                # Create a case-insensitive regex filter for the endpoint column (column 0)
+                self.table_sorter.setRowFilter(javax.swing.RowFilter.regexFilter("(?i)" + re.escape(filter_text), 0))
+        except Exception as e:
+            # If regex is invalid, show all rows
+            print("Filter error: %s" % str(e))
+            self.table_sorter.setRowFilter(None)
 
     #
     # ITab methods
