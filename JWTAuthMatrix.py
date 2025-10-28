@@ -10,10 +10,10 @@ from burp import IBurpExtender
 from burp import IHttpListener
 from burp import ITab
 from java.lang import Object
-from java.awt import BorderLayout, Dimension, Color
-from javax.swing import (JPanel, JFrame, JTable, JScrollPane, JLabel,
+from java.awt import BorderLayout, Dimension, Color, Font
+from javax.swing import (JPanel, JFrame, JTable, JScrollPane, JLabel, JTextArea,
                          JButton, JComboBox, Box, BoxLayout, SwingUtilities,
-                         JSplitPane)
+                         JSplitPane, JTabbedPane)
 from javax.swing.table import AbstractTableModel, DefaultTableCellRenderer
 import base64
 import json
@@ -258,6 +258,24 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab):
         # top-level panel for ITab
         self._panel = JPanel(BorderLayout())
 
+        # Create tabbed pane
+        self.tabbed_pane = JTabbedPane()
+
+        # === Matrix Tab ===
+        matrix_tab = self._create_matrix_tab()
+        self.tabbed_pane.addTab("Authorization Matrix", matrix_tab)
+
+        # === Configuration Tab ===
+        config_tab = self._create_config_tab()
+        self.tabbed_pane.addTab("Configuration", config_tab)
+
+        # Add tabbed pane to main panel
+        self._panel.add(self.tabbed_pane, BorderLayout.CENTER)
+
+    def _create_matrix_tab(self):
+        """Create the matrix visualization tab."""
+        matrix_panel = JPanel(BorderLayout())
+
         # matrix model & table
         self.table_model = JwtMatrixModel(self)
         self.table = JTable(self.table_model)
@@ -268,43 +286,124 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab):
         # simple stats label
         self.stats_label = JLabel("Endpoints: 0    Users: 0")
 
-        matrix_panel = JPanel(BorderLayout())
-        matrix_panel.add(scroll, BorderLayout.CENTER)
-        matrix_panel.add(self.stats_label, BorderLayout.SOUTH)
+        # Color legend panel
+        legend_panel = JPanel()
+        legend_panel.setLayout(BoxLayout(legend_panel, BoxLayout.X_AXIS))
+        label = JLabel("    Color Legend: ")
+        font = label.getFont()
+        label.setFont(Font(font.getFontName(), Font.BOLD, font.getSize()))
+        legend_panel.add(label)
+        legend_panel.add(self._create_color_box(Color(0x38, 0x77, 0x23), "2xx only"))
+        legend_panel.add(Box.createHorizontalStrut(10))
+        legend_panel.add(self._create_color_box(Color(0x87, 0xce, 0xeb), "Mixed 2xx+4xx"))
+        legend_panel.add(Box.createHorizontalStrut(10))
+        legend_panel.add(self._create_color_box(Color(0xff, 0xff, 0x66), "4xx only"))
+        legend_panel.add(Box.createHorizontalStrut(10))
+        legend_panel.add(self._create_color_box(Color(0xff, 0x8c, 0x00), "5xx present"))
+        legend_panel.add(Box.createHorizontalStrut(10))
+        legend_panel.add(self._create_color_box(Color(0xf3, 0x2a, 0x4c), "No requests"))
+        legend_panel.add(Box.createHorizontalGlue())
 
-        # config panel
+        # Bottom panel with stats and legend
+        bottom_panel = JPanel(BorderLayout())
+        bottom_panel.add(self.stats_label, BorderLayout.WEST)
+        bottom_panel.add(legend_panel, BorderLayout.CENTER)
+
+        matrix_panel.add(scroll, BorderLayout.CENTER)
+        matrix_panel.add(bottom_panel, BorderLayout.SOUTH)
+
+        return matrix_panel
+
+    def _create_color_box(self, color, label):
+        """Helper to create a colored box with label for the legend."""
+        panel = JPanel()
+        panel.setLayout(BoxLayout(panel, BoxLayout.X_AXIS))
+        
+        box = JLabel("   ")
+        box.setOpaque(True)
+        box.setBackground(color)
+        box.setPreferredSize(Dimension(20, 15))
+        
+        panel.add(box)
+        panel.add(Box.createHorizontalStrut(5))
+        panel.add(JLabel(label))
+        
+        return panel
+
+    def _create_config_tab(self):
+        """Create the configuration tab."""
         config_panel = JPanel()
         config_panel.setLayout(BoxLayout(config_panel, BoxLayout.Y_AXIS))
-        config_panel.setPreferredSize(Dimension(400, 200))
-        config_panel.add(JLabel("JWT field to use as user identifier (e.g. sub, email, username):"))
-        self.field_combo = JComboBox([self.jwt_user_field, "email", "username", "sub", "id"])
-        # set default editable so user can type arbitrary value
+        
+        # Add padding
+        config_panel.add(Box.createVerticalStrut(20))
+        
+        # JWT Field Configuration
+        field_label = JLabel("JWT User Identifier Field: ")
+        font = field_label.getFont()
+        field_label.setFont(Font(font.getFontName(), Font.BOLD, font.getSize()))
+        field_label.setAlignmentX(0.0)
+        config_panel.add(field_label)
+        config_panel.add(Box.createVerticalStrut(5))
+        
+        field_desc = JLabel("Specify which JWT claim field to use as the user identifier:")
+        field_desc.setAlignmentX(0.0)
+        config_panel.add(field_desc)
+        config_panel.add(Box.createVerticalStrut(5))
+        
+        self.field_combo = JComboBox([self.jwt_user_field, "email", "username", "sub", "id", "user_id"])
         self.field_combo.setEditable(True)
+        self.field_combo.setMaximumSize(Dimension(300, 25))
+        self.field_combo.setAlignmentX(0.0)
         config_panel.add(self.field_combo)
+        
+        config_panel.add(Box.createVerticalStrut(30))
+        
+        # Actions section
+        actions_label = JLabel("Actions: ")
+        font = actions_label.getFont()
+        actions_label.setFont(Font(font.getFontName(), Font.BOLD, font.getSize()))
+        actions_label.setAlignmentX(0.0)
+        config_panel.add(actions_label)
         config_panel.add(Box.createVerticalStrut(10))
+        
         parse_button = JButton("Parse Proxy History and Build Matrix", actionPerformed=self._on_parse_proxy_history)
+        parse_button.setMaximumSize(Dimension(300, 30))
+        parse_button.setAlignmentX(0.0)
         config_panel.add(parse_button)
+        
         config_panel.add(Box.createVerticalStrut(10))
+        
         clear_button = JButton("Clear Matrix", actionPerformed=self._on_clear_matrix)
+        clear_button.setMaximumSize(Dimension(300, 30))
+        clear_button.setAlignmentX(0.0)
         config_panel.add(clear_button)
-        config_panel.add(Box.createVerticalStrut(10))
-        config_panel.add(JLabel("Note: The matrix updates live for Proxy/Repeater/Intruder requests as they occur."))
-        config_panel.add(Box.createVerticalStrut(10))
-        config_panel.add(JLabel("<html><b>Color Legend:</b><br>" +
-                               "Green = 2xx only<br>" +
-                               "Light Blue = Mixed 2xx and 4xx<br>" +
-                               "Yellow = 4xx only<br>" +
-                               "Orange = 5xx present<br>" +
-                               "Red = No requests</html>"))
-
-        # main split: left matrix, right config
-        split = JSplitPane(JSplitPane.HORIZONTAL_SPLIT, matrix_panel, config_panel)
-        split.setDividerLocation(700)
-        self._panel.add(split, BorderLayout.CENTER)
-
-        # small header with title
-        header = JLabel("<html><b>JWT Authorization Matrix (with Response Codes)</b></html>")
-        self._panel.add(header, BorderLayout.NORTH)
+        
+        config_panel.add(Box.createVerticalStrut(30))
+        
+        # Info section
+        info_label = JLabel("Information: ")
+        font = info_label.getFont()
+        info_label.setFont(Font(font.getFontName(), Font.BOLD, font.getSize()))
+        info_label.setAlignmentX(0.0)
+        config_panel.add(info_label)
+        config_panel.add(Box.createVerticalStrut(5))
+        
+        info_text = JTextArea("The matrix updates live as requests pass through:\n" +
+                          "* Proxy\n" +
+                          "* Repeater\n" +
+                          "* Intruder\n\n" +
+                          "Each cell shows HTTP response codes and their counts.\n" +
+                          "Use this to identify authorization issues and access patterns.")
+        info_text.setAlignmentX(0.0)
+        config_panel.add(info_text)
+        
+        config_panel.add(Box.createVerticalGlue())
+        
+        # Wrap in scroll pane
+        scroll = JScrollPane(config_panel)
+        scroll.setBorder(None)
+        return scroll
 
     def _on_clear_matrix(self, event=None):
         # reset data structures
