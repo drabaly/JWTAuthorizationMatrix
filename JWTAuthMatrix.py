@@ -13,9 +13,10 @@ from java.lang import Object
 from java.awt import BorderLayout, Color, Dimension, Font
 from javax.swing import (JPanel, JFrame, JTable, JScrollPane, JLabel, JTextArea,
                          JButton, JComboBox, Box, BoxLayout, SwingUtilities,
-                         JSplitPane, JTabbedPane, JTextField, RowFilter, JCheckBox)
+                         JSplitPane, JTabbedPane, JTextField, RowFilter, JCheckBox, JFileChooser)
 from javax.swing.table import AbstractTableModel, DefaultTableCellRenderer, TableRowSorter
 from javax.swing.event import DocumentListener
+from javax.swing.filechooser import FileNameExtensionFilter
 import javax.swing
 import base64
 import json
@@ -139,6 +140,16 @@ class JwtMatrixModel(AbstractTableModel):
         return ", ".join(["%s: %d" % (code, count) for code, count in sorted_codes])
 
 class BurpExtender(IBurpExtender, IHttpListener, ITab):
+    
+    #
+    # ITab methods - implemented first for Jython compatibility
+    #
+    def getTabCaption(self):
+        return "JWT Auth Matrix"
+
+    def getUiComponent(self):
+        return self._panel
+    
     def registerExtenderCallbacks(self, callbacks):
         self._callbacks = callbacks
         self._helpers = callbacks.getHelpers()
@@ -464,6 +475,28 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab):
         
         config_panel.add(Box.createVerticalStrut(30))
         
+        # Export section
+        export_label = JLabel("Export: ")
+        font = export_label.getFont()
+        export_label.setFont(Font(font.getFontName(), Font.BOLD, font.getSize()))
+        export_label.setAlignmentX(0.0)
+        config_panel.add(export_label)
+        config_panel.add(Box.createVerticalStrut(10))
+        
+        export_csv_button = JButton("Export to CSV", actionPerformed=self._on_export_csv)
+        export_csv_button.setMaximumSize(Dimension(300, 30))
+        export_csv_button.setAlignmentX(0.0)
+        config_panel.add(export_csv_button)
+        
+        config_panel.add(Box.createVerticalStrut(10))
+        
+        export_json_button = JButton("Export to JSON", actionPerformed=self._on_export_json)
+        export_json_button.setMaximumSize(Dimension(300, 30))
+        export_json_button.setAlignmentX(0.0)
+        config_panel.add(export_json_button)
+        
+        config_panel.add(Box.createVerticalStrut(30))
+        
         # Info section
         info_label = JLabel("Information: ")
         font = info_label.getFont()
@@ -479,6 +512,8 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab):
                           "Each cell shows HTTP response codes and their counts.\n" +
                           "Use this to identify authorization issues and access patterns.")
         info_text.setAlignmentX(0.0)
+        info_text.setEditable(False)
+        info_text.setOpaque(False)
         config_panel.add(info_text)
         
         config_panel.add(Box.createVerticalGlue())
@@ -607,14 +642,85 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab):
         except Exception as e:
             print("Error updating JWT field: %s" % str(e))
 
-    #
-    # ITab methods
-    #
-    def getTabCaption(self):
-        return "JWT Auth Matrix"
+    def _on_export_csv(self, event=None):
+        """Export the matrix to CSV format."""
+        try:
+            # Show file chooser
+            chooser = JFileChooser()
+            chooser.setDialogTitle("Save Matrix as CSV")
+            chooser.setFileFilter(FileNameExtensionFilter("CSV files", ["csv"]))
+            result = chooser.showSaveDialog(self._panel)
+            
+            if result == JFileChooser.APPROVE_OPTION:
+                file_path = chooser.getSelectedFile().getAbsolutePath()
+                if not file_path.endswith('.csv'):
+                    file_path += '.csv'
+                
+                # Build CSV content
+                csv_lines = []
+                
+                # Header row
+                header = ["Endpoint"] + list(self.users_order)
+                csv_lines.append(",".join(['"%s"' % h.replace('"', '""') for h in header]))
+                
+                # Data rows
+                for endpoint in self.endpoints_order:
+                    row = ['"%s"' % endpoint.replace('"', '""')]
+                    for user in self.users_order:
+                        code_dict = self.matrix.get(endpoint, {}).get(user, {})
+                        if code_dict:
+                            cell_value = ", ".join(["%s: %d" % (code, count) for code, count in sorted(code_dict.items())])
+                        else:
+                            cell_value = "0"
+                        row.append('"%s"' % cell_value.replace('"', '""'))
+                    csv_lines.append(",".join(row))
+                
+                # Write to file
+                with open(file_path, 'w') as f:
+                    f.write("\n".join(csv_lines))
+                
+                print("Matrix exported to CSV: %s" % file_path)
+        except Exception as e:
+            print("Error exporting to CSV: %s" % str(e))
 
-    def getUiComponent(self):
-        # Fallback if Burp queries UI before build (shouldn't happen with the above fix)
-        if not hasattr(self, "_panel"):
-            self._build_ui()
-        return self._panel
+    def _on_export_json(self, event=None):
+        """Export the matrix to JSON format."""
+        try:
+            # Show file chooser
+            chooser = JFileChooser()
+            chooser.setDialogTitle("Save Matrix as JSON")
+            chooser.setFileFilter(FileNameExtensionFilter("JSON files", ["json"]))
+            result = chooser.showSaveDialog(self._panel)
+            
+            if result == JFileChooser.APPROVE_OPTION:
+                file_path = chooser.getSelectedFile().getAbsolutePath()
+                if not file_path.endswith('.json'):
+                    file_path += '.json'
+                
+                # Build JSON structure
+                export_data = {
+                    "jwt_field": self.jwt_user_field,
+                    "users": list(self.users_order),
+                    "endpoints": []
+                }
+                
+                for endpoint in self.endpoints_order:
+                    endpoint_data = {
+                        "endpoint": endpoint,
+                        "users": {}
+                    }
+                    for user in self.users_order:
+                        code_dict = self.matrix.get(endpoint, {}).get(user, {})
+                        if code_dict:
+                            endpoint_data["users"][user] = dict(code_dict)
+                        else:
+                            endpoint_data["users"][user] = {}
+                    export_data["endpoints"].append(endpoint_data)
+                
+                # Write to file
+                with open(file_path, 'w') as f:
+                    json.dump(export_data, f, indent=2)
+                
+                print("Matrix exported to JSON: %s" % file_path)
+        except Exception as e:
+            print("Error exporting to JSON: %s" % str(e))
