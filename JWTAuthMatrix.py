@@ -13,10 +13,11 @@ from java.lang import Object
 from java.awt import BorderLayout, Color, Dimension, Font
 from javax.swing import (JPanel, JFrame, JTable, JScrollPane, JLabel, JTextArea,
                          JButton, JComboBox, Box, BoxLayout, SwingUtilities,
-                         JSplitPane, JTabbedPane, JTextField, RowFilter, JCheckBox, JFileChooser)
+                         JSplitPane, JTabbedPane, JTextField, RowFilter, JCheckBox, JFileChooser, JColorChooser)
 from javax.swing.table import AbstractTableModel, DefaultTableCellRenderer, TableRowSorter
 from javax.swing.event import DocumentListener
 from javax.swing.filechooser import FileNameExtensionFilter
+from java.awt.event import MouseAdapter
 import javax.swing
 import base64
 import json
@@ -41,6 +42,10 @@ class FilterListener(DocumentListener):
 
 class ColorCellRenderer(DefaultTableCellRenderer):
     """Custom cell renderer for coloring based on response codes."""
+    def __init__(self, extender):
+        DefaultTableCellRenderer.__init__(self)
+        self.extender = extender
+    
     def getTableCellRendererComponent(self, table, value, isSelected, hasFocus, row, col):
         c = DefaultTableCellRenderer.getTableCellRendererComponent(self, table, value, isSelected, hasFocus, row, col)
         try:
@@ -51,7 +56,7 @@ class ColorCellRenderer(DefaultTableCellRenderer):
                 # Parse the value to determine color
                 # value format: "200: 5, 403: 2" or "0" if no requests
                 if value == "0" or value == "" or value == "No requests":
-                    c.setBackground(Color(0xf3, 0x2a, 0x4c))  # red - no requests
+                    c.setBackground(self.extender.color_no_requests)
                 else:
                     # Check for success codes (2xx)
                     has_success = False
@@ -71,13 +76,13 @@ class ColorCellRenderer(DefaultTableCellRenderer):
                     
                     # Color priority: server error > client error > success
                     if has_server_error:
-                        c.setBackground(Color(0xff, 0x8c, 0x00))  # orange - server errors
+                        c.setBackground(self.extender.color_server_error)
                     elif has_client_error and not has_success:
-                        c.setBackground(Color(0xff, 0xff, 0x66))  # yellow - only client errors
+                        c.setBackground(self.extender.color_client_error)
                     elif has_client_error and has_success:
-                        c.setBackground(Color(0x87, 0xce, 0xeb))  # light blue - mixed
+                        c.setBackground(self.extender.color_mixed)
                     else:
-                        c.setBackground(Color(0x38, 0x77, 0x23))  # green - only success
+                        c.setBackground(self.extender.color_success)
 
         except:
             c.setBackground(Color.WHITE)
@@ -162,6 +167,13 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab):
         self.listen_proxy = True
         self.listen_repeater = True
         self.listen_intruder = True
+        
+        # color scheme for response codes (customizable)
+        self.color_success = Color(0x38, 0x77, 0x23)      # green - 2xx only
+        self.color_mixed = Color(0x87, 0xce, 0xeb)        # light blue - mixed 2xx+4xx
+        self.color_client_error = Color(0xff, 0xff, 0x66) # yellow - 4xx only
+        self.color_server_error = Color(0xff, 0x8c, 0x00) # orange - 5xx present
+        self.color_no_requests = Color(0xf3, 0x2a, 0x4c)  # red - no requests
 
         # data: endpoint -> user -> response_code -> count
         self.matrix = defaultdict(lambda: defaultdict(lambda: defaultdict(int)))
@@ -330,7 +342,7 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab):
         self.table = JTable(self.table_model)
         self.table_sorter = TableRowSorter(self.table_model)
         self.table.setRowSorter(self.table_sorter)
-        self.table.setDefaultRenderer(Object, ColorCellRenderer())  # colorize all cells
+        self.table.setDefaultRenderer(Object, ColorCellRenderer(self))  # colorize all cells
         scroll = JScrollPane(self.table)
 
         # simple stats label
@@ -343,15 +355,15 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab):
         font = label.getFont()
         label.setFont(Font(font.getFontName(), Font.BOLD, font.getSize()))
         legend_panel.add(label)
-        legend_panel.add(self._create_color_box(Color(0x38, 0x77, 0x23), "2xx only"))
+        legend_panel.add(self._create_color_box(self.color_success, "2xx only", "success"))
         legend_panel.add(Box.createHorizontalStrut(10))
-        legend_panel.add(self._create_color_box(Color(0x87, 0xce, 0xeb), "Mixed 2xx+4xx"))
+        legend_panel.add(self._create_color_box(self.color_mixed, "Mixed 2xx+4xx", "mixed"))
         legend_panel.add(Box.createHorizontalStrut(10))
-        legend_panel.add(self._create_color_box(Color(0xff, 0xff, 0x66), "4xx only"))
+        legend_panel.add(self._create_color_box(self.color_client_error, "4xx only", "client_error"))
         legend_panel.add(Box.createHorizontalStrut(10))
-        legend_panel.add(self._create_color_box(Color(0xff, 0x8c, 0x00), "5xx present"))
+        legend_panel.add(self._create_color_box(self.color_server_error, "5xx present", "server_error"))
         legend_panel.add(Box.createHorizontalStrut(10))
-        legend_panel.add(self._create_color_box(Color(0xf3, 0x2a, 0x4c), "No requests"))
+        legend_panel.add(self._create_color_box(self.color_no_requests, "No requests", "no_requests"))
         legend_panel.add(Box.createHorizontalGlue())
 
         # Bottom panel with stats and legend
@@ -365,7 +377,7 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab):
 
         return matrix_panel
 
-    def _create_color_box(self, color, label):
+    def _create_color_box(self, color, label, color_type):
         """Helper to create a colored box with label for the legend."""
         panel = JPanel()
         panel.setLayout(BoxLayout(panel, BoxLayout.X_AXIS))
@@ -374,6 +386,22 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab):
         box.setOpaque(True)
         box.setBackground(color)
         box.setPreferredSize(Dimension(20, 15))
+        
+        # Make the color box clickable
+        class ColorClickListener(MouseAdapter):
+            def __init__(self, extender, color_type):
+                self.extender = extender
+                self.color_type = color_type
+            
+            def mouseClicked(self, event):
+                self.extender._on_color_change(self.color_type)
+        
+        box.addMouseListener(ColorClickListener(self, color_type))
+        box.setToolTipText("Click to change color")
+        
+        # Make cursor change to hand on hover
+        from java.awt import Cursor
+        box.setCursor(Cursor.getPredefinedCursor(Cursor.HAND_CURSOR))
         
         panel.add(box)
         panel.add(Box.createHorizontalStrut(5))
@@ -641,6 +669,64 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab):
                 print("Note: This will apply to new requests. To rebuild the matrix with the new field, click 'Parse Proxy History'.")
         except Exception as e:
             print("Error updating JWT field: %s" % str(e))
+
+    def _on_color_change(self, color_type):
+        """Open color picker to change a color scheme."""
+        try:
+            # Get current color
+            current_color = None
+            title = ""
+            
+            if color_type == "success":
+                current_color = self.color_success
+                title = "Choose color for 2xx responses"
+            elif color_type == "mixed":
+                current_color = self.color_mixed
+                title = "Choose color for mixed 2xx+4xx responses"
+            elif color_type == "client_error":
+                current_color = self.color_client_error
+                title = "Choose color for 4xx responses"
+            elif color_type == "server_error":
+                current_color = self.color_server_error
+                title = "Choose color for 5xx responses"
+            elif color_type == "no_requests":
+                current_color = self.color_no_requests
+                title = "Choose color for no requests"
+            
+            # Show color chooser
+            new_color = JColorChooser.showDialog(self._panel, title, current_color)
+            
+            if new_color is not None:
+                # Update the color
+                if color_type == "success":
+                    self.color_success = new_color
+                elif color_type == "mixed":
+                    self.color_mixed = new_color
+                elif color_type == "client_error":
+                    self.color_client_error = new_color
+                elif color_type == "server_error":
+                    self.color_server_error = new_color
+                elif color_type == "no_requests":
+                    self.color_no_requests = new_color
+                
+                # Refresh the table to apply new colors
+                self.table.repaint()
+                
+                # Rebuild the legend with new colors
+                self._rebuild_matrix_tab()
+                
+                print("Color updated for %s" % color_type)
+        except Exception as e:
+            print("Error changing color: %s" % str(e))
+
+    def _rebuild_matrix_tab(self):
+        """Rebuild the matrix tab to reflect new colors in the legend."""
+        try:
+            # Get the current matrix tab
+            matrix_tab = self._create_matrix_tab()
+            self.tabbed_pane.setComponentAt(0, matrix_tab)
+        except Exception as e:
+            print("Error rebuilding matrix tab: %s" % str(e))
 
     def _on_export_csv(self, event=None):
         """Export the matrix to CSV format."""
