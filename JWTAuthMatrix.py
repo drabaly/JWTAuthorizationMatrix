@@ -433,6 +433,13 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab):
         self.field_combo.setAlignmentX(0.0)
         config_panel.add(self.field_combo)
         
+        config_panel.add(Box.createVerticalStrut(10))
+        
+        update_field_button = JButton("Update JWT Field", actionPerformed=self._on_update_jwt_field)
+        update_field_button.setMaximumSize(Dimension(300, 30))
+        update_field_button.setAlignmentX(0.0)
+        config_panel.add(update_field_button)
+        
         config_panel.add(Box.createVerticalStrut(30))
         
         # Actions section
@@ -587,6 +594,18 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab):
             self.listen_intruder = self.intruder_checkbox.isSelected()
         except:
             pass
+
+    def _on_update_jwt_field(self, event=None):
+        """Update the JWT field from the combo box."""
+        try:
+            chosen = self.field_combo.getEditor().getItem().strip()
+            if chosen:
+                old_field = self.jwt_user_field
+                self.jwt_user_field = chosen
+                print("JWT field updated from '%s' to '%s'" % (old_field, chosen))
+                print("Note: This will apply to new requests. To rebuild the matrix with the new field, click 'Parse Proxy History'.")
+        except Exception as e:
+            print("Error updating JWT field: %s" % str(e))
 
     #
     # ITab methods
