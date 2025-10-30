@@ -10,10 +10,10 @@ from burp import IBurpExtender
 from burp import IHttpListener
 from burp import ITab
 from java.lang import Object
-from java.awt import BorderLayout, Dimension, Color, Font
+from java.awt import BorderLayout, Color, Dimension, Font
 from javax.swing import (JPanel, JFrame, JTable, JScrollPane, JLabel, JTextArea,
                          JButton, JComboBox, Box, BoxLayout, SwingUtilities,
-                         JSplitPane, JTabbedPane, JTextField, RowFilter)
+                         JSplitPane, JTabbedPane, JTextField, RowFilter, JCheckBox)
 from javax.swing.table import AbstractTableModel, DefaultTableCellRenderer, TableRowSorter
 from javax.swing.event import DocumentListener
 import javax.swing
@@ -146,6 +146,11 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab):
 
         # configuration defaults
         self.jwt_user_field = "sub"
+        
+        # tool listening flags (enabled by default)
+        self.listen_proxy = True
+        self.listen_repeater = True
+        self.listen_intruder = True
 
         # data: endpoint -> user -> response_code -> count
         self.matrix = defaultdict(lambda: defaultdict(lambda: defaultdict(int)))
@@ -172,14 +177,19 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab):
     def processHttpMessage(self, toolFlag, messageIsRequest, messageInfo):
         # We need both request (for JWT/endpoint) and response (for status code)
         try:
-            interested = ((toolFlag & self.TOOL_PROXY) or
-                          (toolFlag & self.TOOL_REPEATER) or
-                          (toolFlag & self.TOOL_INTRUDER))
+            # Check if we should listen to this tool based on user preferences
+            should_listen = False
+            if (toolFlag & self.TOOL_PROXY) and self.listen_proxy:
+                should_listen = True
+            if (toolFlag & self.TOOL_REPEATER) and self.listen_repeater:
+                should_listen = True
+            if (toolFlag & self.TOOL_INTRUDER) and self.listen_intruder:
+                should_listen = True
         except:
             # fallback if constants don't behave as expected
-            interested = True
+            should_listen = True
 
-        if not interested:
+        if not should_listen:
             return
 
         # Only process responses (we'll get the request data from the same messageInfo)
@@ -233,6 +243,9 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab):
             # notify table model to update
             # UI update must be on Swing thread
             SwingUtilities.invokeLater(lambda: self._update_table_model())
+            
+            # Also update listening preferences in case checkboxes changed
+            self._update_listening_preferences()
         except Exception as e:
             # do not crash Burp; log for user
             print("JWT Matrix: error processing message - %s" % str(e))
@@ -365,6 +378,42 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab):
         # Add padding
         config_panel.add(Box.createVerticalStrut(20))
         
+        # Listening Tools Section
+        tools_label = JLabel("Listen to Tools: ")
+        font = tools_label.getFont()
+        tools_label.setFont(Font(font.getFontName(), Font.BOLD, font.getSize()))
+        tools_label.setAlignmentX(0.0)
+        config_panel.add(tools_label)
+        config_panel.add(Box.createVerticalStrut(5))
+        
+        tools_desc = JLabel("Select which Burp tools to monitor for JWT requests:")
+        tools_desc.setAlignmentX(0.0)
+        config_panel.add(tools_desc)
+        config_panel.add(Box.createVerticalStrut(10))
+        
+        # Create a sub-panel for checkboxes with left padding
+        checkbox_panel = JPanel()
+        checkbox_panel.setLayout(BoxLayout(checkbox_panel, BoxLayout.Y_AXIS))
+        checkbox_panel.setAlignmentX(0.0)
+        
+        self.proxy_checkbox = JCheckBox("Proxy", self.listen_proxy, actionPerformed=lambda e: self._update_listening_preferences())
+        self.proxy_checkbox.setAlignmentX(0.0)
+        checkbox_panel.add(self.proxy_checkbox)
+        checkbox_panel.add(Box.createVerticalStrut(5))
+        
+        self.repeater_checkbox = JCheckBox("Repeater", self.listen_repeater, actionPerformed=lambda e: self._update_listening_preferences())
+        self.repeater_checkbox.setAlignmentX(0.0)
+        checkbox_panel.add(self.repeater_checkbox)
+        checkbox_panel.add(Box.createVerticalStrut(5))
+        
+        self.intruder_checkbox = JCheckBox("Intruder", self.listen_intruder, actionPerformed=lambda e: self._update_listening_preferences())
+        self.intruder_checkbox.setAlignmentX(0.0)
+        checkbox_panel.add(self.intruder_checkbox)
+        
+        config_panel.add(checkbox_panel)
+        
+        config_panel.add(Box.createVerticalStrut(30))
+        
         # JWT Field Configuration
         field_label = JLabel("JWT User Identifier Field: ")
         font = field_label.getFont()
@@ -440,6 +489,9 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab):
         SwingUtilities.invokeLater(lambda: self._update_table_model())
 
     def _on_parse_proxy_history(self, event=None):
+        # Update listening preferences from checkboxes
+        self._update_listening_preferences()
+        
         # get configured field
         try:
             chosen = self.field_combo.getEditor().getItem().strip()
@@ -526,6 +578,15 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab):
             # If regex is invalid, show all rows
             print("Filter error: %s" % str(e))
             self.table_sorter.setRowFilter(None)
+
+    def _update_listening_preferences(self):
+        """Update listening preferences from checkboxes."""
+        try:
+            self.listen_proxy = self.proxy_checkbox.isSelected()
+            self.listen_repeater = self.repeater_checkbox.isSelected()
+            self.listen_intruder = self.intruder_checkbox.isSelected()
+        except:
+            pass
 
     #
     # ITab methods
