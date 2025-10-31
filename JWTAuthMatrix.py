@@ -9,13 +9,15 @@
 from burp import IBurpExtender
 from burp import IHttpListener
 from burp import ITab
+from burp import IMessageEditorController
 from java.lang import Object
 from java.awt import BorderLayout, Color, Dimension, Font
 from javax.swing import (JPanel, JFrame, JTable, JScrollPane, JLabel, JTextArea,
                          JButton, JComboBox, Box, BoxLayout, SwingUtilities,
-                         JSplitPane, JTabbedPane, JTextField, RowFilter, JCheckBox, JFileChooser, JColorChooser)
+                         JSplitPane, JTabbedPane, JTextField, RowFilter, JCheckBox, JFileChooser, 
+                         JColorChooser, JDialog, JPopupMenu, JMenuItem, ListSelectionModel)
 from javax.swing.table import AbstractTableModel, DefaultTableCellRenderer, TableRowSorter
-from javax.swing.event import DocumentListener
+from javax.swing.event import DocumentListener, ListSelectionListener
 from javax.swing.filechooser import FileNameExtensionFilter
 from java.awt.event import MouseAdapter
 import javax.swing
@@ -23,6 +25,7 @@ import base64
 import json
 from collections import defaultdict, OrderedDict
 import re
+import java.util.Date
 
 
 class FilterListener(DocumentListener):
@@ -177,6 +180,8 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab):
 
         # data: endpoint -> user -> response_code -> count
         self.matrix = defaultdict(lambda: defaultdict(lambda: defaultdict(int)))
+        # store actual request details: endpoint -> user -> response_code -> list of IHttpRequestResponse objects
+        self.request_details = defaultdict(lambda: defaultdict(lambda: defaultdict(list)))
         self.endpoints_order = []
         self.users_order = []
 
@@ -263,6 +268,9 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab):
                 self.users_order.append(user)
             self.matrix[endpoint][user][response_code] += 1
             
+            # Store the complete IHttpRequestResponse object
+            self.request_details[endpoint][user][response_code].append(messageInfo)
+            
             # notify table model to update
             # UI update must be on Swing thread
             SwingUtilities.invokeLater(lambda: self._update_table_model())
@@ -343,6 +351,27 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab):
         self.table_sorter = TableRowSorter(self.table_model)
         self.table.setRowSorter(self.table_sorter)
         self.table.setDefaultRenderer(Object, ColorCellRenderer(self))  # colorize all cells
+        
+        # Add mouse listener for cell clicks
+        class CellClickListener(MouseAdapter):
+            def __init__(self, extender):
+                self.extender = extender
+            
+            def mouseClicked(self, event):
+                table = event.getSource()
+                row = table.rowAtPoint(event.getPoint())
+                col = table.columnAtPoint(event.getPoint())
+                
+                # Don't process clicks on endpoint column (col 0)
+                if col > 0 and row >= 0:
+                    # Get actual row index (accounting for sorting/filtering)
+                    model_row = table.convertRowIndexToModel(row)
+                    endpoint = self.extender.table_model.endpoints[model_row]
+                    user = self.extender.table_model.users[col - 1]
+                    self.extender._show_request_details(endpoint, user)
+        
+        self.table.addMouseListener(CellClickListener(self))
+        
         scroll = JScrollPane(self.table)
 
         # simple stats label
@@ -554,6 +583,7 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab):
     def _on_clear_matrix(self, event=None):
         # reset data structures
         self.matrix = defaultdict(lambda: defaultdict(lambda: defaultdict(int)))
+        self.request_details = defaultdict(lambda: defaultdict(lambda: defaultdict(list)))
         self.endpoints_order = []
         self.users_order = []
         SwingUtilities.invokeLater(lambda: self._update_table_model())
@@ -574,6 +604,7 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab):
             history = self._callbacks.getProxyHistory()
             # reset matrix first
             self.matrix = defaultdict(lambda: defaultdict(lambda: defaultdict(int)))
+            self.request_details = defaultdict(lambda: defaultdict(lambda: defaultdict(list)))
             self.endpoints_order = []
             self.users_order = []
             for item in history:
@@ -612,6 +643,9 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab):
                     if user not in self.users_order:
                         self.users_order.append(user)
                     self.matrix[endpoint][user][response_code] += 1
+                    
+                    # Store the IHttpRequestResponse object
+                    self.request_details[endpoint][user][response_code].append(item)
                 except Exception:
                     # skip single items on error
                     continue
@@ -728,6 +762,203 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab):
         except Exception as e:
             print("Error rebuilding matrix tab: %s" % str(e))
 
+    def _show_request_details(self, endpoint, user):
+        """Show a dialog with details of all requests for a specific endpoint/user combination."""
+        try:
+            # Get all request details for this endpoint/user
+            code_dict = self.request_details.get(endpoint, {}).get(user, {})
+            
+            if not code_dict:
+                # No requests found
+                return
+            
+            # Collect all IHttpRequestResponse objects
+            all_requests = []
+            for response_code in sorted(code_dict.keys()):
+                for http_message in code_dict[response_code]:
+                    all_requests.append(http_message)
+            
+            if not all_requests:
+                return
+            
+            # Create dialog
+            dialog = JDialog(SwingUtilities.getWindowAncestor(self._panel), "Request Details", False)
+            dialog.setSize(1200, 800)
+            dialog.setLocationRelativeTo(self._panel)
+            
+            # Create main split pane
+            main_split = JSplitPane(JSplitPane.HORIZONTAL_SPLIT)
+            
+            # Left side: List of requests
+            left_panel = JPanel(BorderLayout())
+            
+            # Header info
+            header = JLabel("Endpoint: %s | User: %s | Total Requests: %d" % 
+                          (endpoint, user, len(all_requests)))
+            left_panel.add(header, BorderLayout.NORTH)
+            
+            # Create table model for requests list
+            column_names = ["#", "Response Code", "Method"]
+            data = []
+            
+            for i, http_message in enumerate(all_requests):
+                analyzed_req = self._helpers.analyzeRequest(http_message)
+                headers = analyzed_req.getHeaders()
+                method = headers[0].split(' ')[0] if headers and len(headers)>0 else "GET"
+                
+                response = http_message.getResponse()
+                if response:
+                    analyzed_resp = self._helpers.analyzeResponse(response)
+                    response_code = str(analyzed_resp.getStatusCode())
+                else:
+                    response_code = "N/A"
+                
+                data.append([str(i + 1), response_code, method])
+            
+            # Create table
+            from javax.swing.table import DefaultTableModel
+            table_model = DefaultTableModel(data, column_names)
+            requests_table = JTable(table_model)
+            requests_table.setSelectionMode(ListSelectionModel.SINGLE_SELECTION)
+            
+            # Create message editor controller
+            message_controller = RequestDetailsController(self, all_requests)
+            
+            # Create request/response viewers
+            request_viewer = self._callbacks.createMessageEditor(message_controller, False)
+            response_viewer = self._callbacks.createMessageEditor(message_controller, False)
+            
+            # Right side: Request/Response viewers
+            right_split = JSplitPane(JSplitPane.VERTICAL_SPLIT)
+            
+            request_panel = JPanel(BorderLayout())
+            request_panel.add(JLabel("Request"), BorderLayout.NORTH)
+            request_panel.add(request_viewer.getComponent(), BorderLayout.CENTER)
+            
+            response_panel = JPanel(BorderLayout())
+            response_panel.add(JLabel("Response"), BorderLayout.NORTH)
+            response_panel.add(response_viewer.getComponent(), BorderLayout.CENTER)
+            
+            right_split.setTopComponent(request_panel)
+            right_split.setBottomComponent(response_panel)
+            right_split.setDividerLocation(400)
+            
+            # Selection listener for the table
+            class RequestSelectionListener(ListSelectionListener):
+                def __init__(self, controller, req_viewer, resp_viewer, requests):
+                    self.controller = controller
+                    self.req_viewer = req_viewer
+                    self.resp_viewer = resp_viewer
+                    self.requests = requests
+                
+                def valueChanged(self, e):
+                    if not e.getValueIsAdjusting():
+                        table = e.getSource()
+                        selected_row = table.getMinSelectionIndex()
+                        if selected_row >= 0:
+                            http_message = self.requests[selected_row]
+                            self.controller.setCurrentMessage(http_message)
+                            self.req_viewer.setMessage(http_message.getRequest(), True)
+                            response = http_message.getResponse()
+                            if response:
+                                self.resp_viewer.setMessage(response, False)
+                            else:
+                                self.resp_viewer.setMessage(None, False)
+            
+            requests_table.getSelectionModel().addListSelectionListener(
+                RequestSelectionListener(message_controller, request_viewer, response_viewer, all_requests))
+            
+            # Right-click menu for sending to other tools
+            class RequestTableMouseListener(MouseAdapter):
+                def __init__(self, extender, requests):
+                    self.extender = extender
+                    self.requests = requests
+                
+                def mousePressed(self, e):
+                    self.maybeShowPopup(e)
+                
+                def mouseReleased(self, e):
+                    self.maybeShowPopup(e)
+                
+                def maybeShowPopup(self, e):
+                    if e.isPopupTrigger():
+                        table = e.getSource()
+                        row = table.rowAtPoint(e.getPoint())
+                        if row >= 0:
+                            table.setRowSelectionInterval(row, row)
+                            http_message = self.requests[row]
+                            popup = self.createPopupMenu(http_message)
+                            popup.show(e.getComponent(), e.getX(), e.getY())
+                
+                def createPopupMenu(self, http_message):
+                    popup = JPopupMenu()
+                    
+                    send_to_repeater = JMenuItem("Send to Repeater")
+                    send_to_repeater.addActionListener(lambda e: self.sendToRepeater(http_message))
+                    popup.add(send_to_repeater)
+                    
+                    send_to_intruder = JMenuItem("Send to Intruder")
+                    send_to_intruder.addActionListener(lambda e: self.sendToIntruder(http_message))
+                    popup.add(send_to_intruder)
+                    
+                    send_to_comparer = JMenuItem("Send to Comparer")
+                    send_to_comparer.addActionListener(lambda e: self.sendToComparer(http_message))
+                    popup.add(send_to_comparer)
+                    
+                    return popup
+                
+                def sendToRepeater(self, http_message):
+                    analyzed = self.extender._helpers.analyzeRequest(http_message)
+                    url = analyzed.getUrl()
+                    self.extender._callbacks.sendToRepeater(
+                        url.getHost(),
+                        url.getPort(),
+                        url.getProtocol() == "https",
+                        http_message.getRequest(),
+                        None
+                    )
+                    print("Sent request to Repeater")
+                
+                def sendToIntruder(self, http_message):
+                    analyzed = self.extender._helpers.analyzeRequest(http_message)
+                    url = analyzed.getUrl()
+                    self.extender._callbacks.sendToIntruder(
+                        url.getHost(),
+                        url.getPort(),
+                        url.getProtocol() == "https",
+                        http_message.getRequest()
+                    )
+                    print("Sent request to Intruder")
+                
+                def sendToComparer(self, http_message):
+                    self.extender._callbacks.sendToComparer(http_message.getRequest())
+                    print("Sent request to Comparer")
+            
+            requests_table.addMouseListener(RequestTableMouseListener(self, all_requests))
+            
+            # Add table to scroll pane
+            scroll = JScrollPane(requests_table)
+            left_panel.add(scroll, BorderLayout.CENTER)
+            
+            # Set up split pane
+            main_split.setLeftComponent(left_panel)
+            main_split.setRightComponent(right_split)
+            main_split.setDividerLocation(300)
+            
+            # Show dialog
+            dialog.setContentPane(main_split)
+            
+            # Select first request by default
+            if len(all_requests) > 0:
+                requests_table.setRowSelectionInterval(0, 0)
+            
+            dialog.setVisible(True)
+            
+        except Exception as e:
+            import traceback
+            print("Error showing request details: %s" % str(e))
+            traceback.print_exc()
+
     def _on_export_csv(self, event=None):
         """Export the matrix to CSV format."""
         try:
@@ -810,3 +1041,28 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab):
                 print("Matrix exported to JSON: %s" % file_path)
         except Exception as e:
             print("Error exporting to JSON: %s" % str(e))
+
+class RequestDetailsController(IMessageEditorController):
+    """Controller for the message editors in the request details dialog."""
+    def __init__(self, extender, requests):
+        self.extender = extender
+        self.requests = requests
+        self.current_message = None
+    
+    def setCurrentMessage(self, message):
+        self.current_message = message
+    
+    def getHttpService(self):
+        if self.current_message:
+            return self.current_message.getHttpService()
+        return None
+    
+    def getRequest(self):
+        if self.current_message:
+            return self.current_message.getRequest()
+        return None
+    
+    def getResponse(self):
+        if self.current_message:
+            return self.current_message.getResponse()
+        return None
