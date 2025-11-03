@@ -10,6 +10,7 @@ from burp import IBurpExtender
 from burp import IHttpListener
 from burp import ITab
 from burp import IMessageEditorController
+from burp import IContextMenuFactory
 from java.lang import Object
 from java.awt import BorderLayout, Color, Dimension, Font
 from javax.swing import (JPanel, JFrame, JTable, JScrollPane, JLabel, JTextArea,
@@ -27,6 +28,7 @@ import json
 from collections import defaultdict, OrderedDict
 import re
 import java.util.Date
+from java.util import ArrayList
 
 
 class FilterListener(DocumentListener):
@@ -264,6 +266,7 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab):
         # register listeners
         callbacks.registerHttpListener(self)
         callbacks.addSuiteTab(self)
+        callbacks.registerContextMenuFactory(JwtMatrixContextMenu(self))
 
         # constants
         self.TOOL_PROXY = callbacks.TOOL_PROXY
@@ -1074,6 +1077,94 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab):
                 print("Matrix exported to JSON: %s" % file_path)
         except Exception as e:
             print("Error exporting to JSON: %s" % str(e))
+
+class JwtMatrixContextMenu(IContextMenuFactory):
+    """Adds context menu to send requests to JWT Matrix"""
+    
+    def __init__(self, extender):
+        self.extender = extender
+
+    def createMenuItems(self, invocation):
+        menu_items = ArrayList()
+        
+        # Only show menu item for requests with JWT tokens
+        ctx = invocation.getSelectedMessages()
+        if ctx is None or len(ctx) == 0:
+            return menu_items
+
+        request = ctx[0]  # Get first selected request
+        analyzed_req = self.extender._helpers.analyzeRequest(request)
+        headers = analyzed_req.getHeaders()
+        
+        # Check for Authorization header with JWT
+        has_jwt = False
+        for header in headers:
+            if header.lower().startswith("authorization:") and "bearer" in header.lower():
+                has_jwt = True
+                break
+        
+        if has_jwt:
+            menu_item = JMenuItem("Send to JWT Authorization Matrix")
+            menu_item.addActionListener(lambda x: self.send_to_matrix(ctx))
+            menu_items.add(menu_item)
+        
+        return menu_items
+
+
+    def send_to_matrix(self, messages):
+        """Process selected message(s) and add to matrix"""
+        for message in messages:
+            try:
+                # Similar logic as processHttpMessage
+                analyzed_req = self.extender._helpers.analyzeRequest(message)
+                headers = analyzed_req.getHeaders()
+                url = analyzed_req.getUrl()
+                method = headers[0].split(' ')[0] if headers and len(headers)>0 else "GET"
+                endpoint = "%s %s" % (method, url.getPath() + (("?" + url.getQuery()) if url.getQuery() else ""))
+                
+                # Get response if available
+                response = message.getResponse()
+                if response is None:
+                    continue
+                    
+                analyzed_resp = self.extender._helpers.analyzeResponse(response)
+                response_code = str(analyzed_resp.getStatusCode())
+                
+                # Find Authorization header
+                auth_header = None
+                for h in headers:
+                    if h.lower().startswith("authorization:"):
+                        auth_header = h
+                        break
+                        
+                if not auth_header:
+                    continue
+                    
+                parts = auth_header.split(":",1)[1].strip().split()
+                if len(parts) < 2:
+                    continue
+                    
+                token = parts[1].strip()
+                user = self.extender._parse_jwt_get_field(token, self.extender.jwt_user_field)
+                if user is None:
+                    user = "<no-%s>" % self.extender.jwt_user_field
+                
+                # Add to matrix data structures
+                if endpoint not in self.extender.endpoints_order:
+                    self.extender.endpoints_order.append(endpoint)
+                if user not in self.extender.users_order:
+                    self.extender.users_order.append(user)
+                    
+                self.extender.matrix[endpoint][user][response_code] += 1
+                self.extender.request_details[endpoint][user][response_code].append(message)
+                
+                # Update UI
+                SwingUtilities.invokeLater(lambda: self.extender._update_table_model())
+                
+                print("Added request to JWT Matrix: %s" % endpoint)
+                
+            except Exception as e:
+                print("Error processing request for JWT Matrix: %s" % str(e))
 
 class RequestDetailsController(IMessageEditorController):
     """Controller for the message editors in the request details dialog."""
