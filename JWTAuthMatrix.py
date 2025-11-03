@@ -1104,8 +1104,17 @@ class JwtMatrixContextMenu(IContextMenuFactory):
                 break
         
         if has_jwt:
+            # Create action listener class instead of using lambda
+            class MenuItemAction(java.awt.event.ActionListener):
+                def __init__(self, context, matrix):
+                    self.context = context
+                    self.matrix = matrix
+                
+                def actionPerformed(self, e):
+                    self.matrix.send_to_matrix(self.context)
+            
             menu_item = JMenuItem("Send to JWT Authorization Matrix")
-            menu_item.addActionListener(lambda x: self.send_to_matrix(ctx))
+            menu_item.addActionListener(MenuItemAction(ctx, self))
             menu_items.add(menu_item)
         
         return menu_items
