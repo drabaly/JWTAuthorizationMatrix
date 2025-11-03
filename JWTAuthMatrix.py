@@ -353,6 +353,10 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab):
             
             # Also update listening preferences in case checkboxes changed
             self._update_listening_preferences()
+            
+            # Update JWT table if we have a valid user and token
+            if user and token and not user.startswith("<no-"):
+                self._update_jwt_table(user, token)
         except Exception as e:
             # do not crash Burp; log for user
             print("JWT Matrix: error processing message - %s" % str(e))
@@ -428,6 +432,10 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab):
         self.table.setRowSorter(self.table_sorter)
         self.table.setDefaultRenderer(Object, ColorCellRenderer(self))  # colorize all cells
         
+        # Increase row height for matrix table
+        self.table.setRowHeight(30)  # Set default row height
+        self.table.getTableHeader().setPreferredSize(Dimension(self.table.getTableHeader().getPreferredSize().width, 25))
+
         # Add mouse listener for cell clicks
         class CellClickListener(MouseAdapter):
             def __init__(self, extender):
@@ -641,6 +649,58 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab):
         export_json_button.setMaximumSize(Dimension(300, 30))
         export_json_button.setAlignmentX(0.0)
         config_panel.add(export_json_button)
+        
+        config_panel.add(Box.createVerticalStrut(30))
+        
+        # JWT Management Section
+        jwt_label = JLabel("JWT Management: ")
+        font = jwt_label.getFont()
+        jwt_label.setFont(Font(font.getFontName(), Font.BOLD, font.getSize()))
+        jwt_label.setAlignmentX(0.0)
+        config_panel.add(jwt_label)
+        config_panel.add(Box.createVerticalStrut(5))
+        
+        jwt_desc = JLabel("Track JWT tokens for each user:")
+        jwt_desc.setAlignmentX(0.0)
+        config_panel.add(jwt_desc)
+        config_panel.add(Box.createVerticalStrut(10))
+        
+        # Create JWT table
+        self.jwt_table_model = JwtTableModel()
+        jwt_table = JTable(self.jwt_table_model)
+        jwt_table.setAutoCreateRowSorter(True)
+        
+        # Set column widths
+        jwt_table.getColumnModel().getColumn(0).setPreferredWidth(100)  # User
+        jwt_table.getColumnModel().getColumn(1).setPreferredWidth(300)  # JWT
+        jwt_table.getColumnModel().getColumn(2).setPreferredWidth(150)  # Last Seen
+        
+        # Add table to scroll pane
+        jwt_scroll = JScrollPane(jwt_table)
+        jwt_scroll.setPreferredSize(Dimension(600, 200))
+        jwt_scroll.setMaximumSize(Dimension(1000, 200))
+        jwt_scroll.setAlignmentX(0.0)
+        config_panel.add(jwt_scroll)
+        
+        # Increase row height for JWT table
+        jwt_table.setRowHeight(30)  # Set default row height
+        jwt_table.getTableHeader().setPreferredSize(Dimension(jwt_table.getTableHeader().getPreferredSize().width, 25))
+
+        # Add buttons panel
+        jwt_buttons = JPanel()
+        jwt_buttons.setLayout(BoxLayout(jwt_buttons, BoxLayout.X_AXIS))
+        jwt_buttons.setAlignmentX(0.0)
+        
+        add_jwt_button = JButton("Add Row", actionPerformed=self._on_add_jwt_row)
+        delete_jwt_button = JButton("Delete Selected", actionPerformed=lambda e: self._on_delete_jwt_row(jwt_table))
+        
+        jwt_buttons.add(add_jwt_button)
+        jwt_buttons.add(Box.createHorizontalStrut(10))
+        jwt_buttons.add(delete_jwt_button)
+        jwt_buttons.add(Box.createHorizontalGlue())
+        
+        config_panel.add(Box.createVerticalStrut(10))
+        config_panel.add(jwt_buttons)
         
         config_panel.add(Box.createVerticalStrut(30))
         
@@ -1078,6 +1138,33 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab):
         except Exception as e:
             print("Error exporting to JSON: %s" % str(e))
 
+    def _on_add_jwt_row(self, event):
+        """Add a new empty row to the JWT table."""
+        self.jwt_table_model.addRow(["", "", ""])
+
+    def _on_delete_jwt_row(self, table):
+        """Delete selected rows from the JWT table."""
+        rows = table.getSelectedRows()
+        if rows:
+            # Convert view indices to model indices
+            model_rows = [table.convertRowIndexToModel(row) for row in rows]
+            # Remove rows in reverse order to maintain indices
+            for row in sorted(model_rows, reverse=True):
+                self.jwt_table_model.removeRow(row)
+                # Update user_rows mapping
+                new_mapping = {}
+                for user, idx in self.jwt_table_model.user_rows.items():
+                    if idx < row:
+                        new_mapping[user] = idx
+                    elif idx > row:
+                        new_mapping[user] = idx - 1
+                self.jwt_table_model.user_rows = new_mapping
+
+    def _update_jwt_table(self, user, jwt):
+        """Update the JWT table with a new token."""
+        timestamp = java.util.Date().toString()
+        SwingUtilities.invokeLater(lambda: self.jwt_table_model.update_jwt(user, jwt, timestamp))
+
 class JwtMatrixContextMenu(IContextMenuFactory):
     """Adds context menu to send requests to JWT Matrix"""
     
@@ -1199,3 +1286,24 @@ class RequestDetailsController(IMessageEditorController):
         if self.current_message:
             return self.current_message.getResponse()
         return None
+
+class JwtTableModel(DefaultTableModel):
+    def __init__(self):
+        super(JwtTableModel, self).__init__(
+            [], 
+            ["User", "JWT Token", "Last Seen"]
+        )
+        self.user_rows = {}  # user -> row index mapping
+    
+    def isCellEditable(self, row, col):
+        return col < 2  # Only User and JWT columns are editable
+    
+    def update_jwt(self, user, jwt, timestamp):
+        if user in self.user_rows:
+            row = self.user_rows[user]
+            self.setValueAt(jwt, row, 1)
+            self.setValueAt(timestamp, row, 2)
+        else:
+            row = self.getRowCount()
+            self.addRow([user, jwt, timestamp])
+            self.user_rows[user] = row
