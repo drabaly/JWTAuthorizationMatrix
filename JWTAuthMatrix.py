@@ -905,7 +905,7 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab):
             left_panel = JPanel(BorderLayout())
             
             # Header info
-            header = JLabel("<html><b>Endpoint:</b> %s<br><b>User:</b> %s<br><b>Total Requests:</b> %d</html>" % 
+            header = JLabel("Endpoint: %s User: %s Total Requests: %d" % 
                           (endpoint, user, len(all_requests)))
             left_panel.add(header, BorderLayout.NORTH)
             
@@ -1100,7 +1100,7 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab):
             left_panel = JPanel(BorderLayout())
             
             # Header info
-            header = JLabel("<html><b>Endpoint:</b> %s (all variants)<br><b>User:</b> %s<br><b>Total Requests:</b> %d</html>" % 
+            header = JLabel("Endpoint: %s (all variants) User: %s Total Requests: %d" % 
                           (base_endpoint, user, len(all_requests)))
             left_panel.add(header, BorderLayout.NORTH)
             
