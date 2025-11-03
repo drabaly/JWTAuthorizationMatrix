@@ -20,7 +20,7 @@ from javax.swing import (JPanel, JFrame, JTable, JScrollPane, JLabel, JTextArea,
 from javax.swing.table import AbstractTableModel, DefaultTableCellRenderer, TableRowSorter, DefaultTableModel
 from javax.swing.event import DocumentListener, ListSelectionListener
 from javax.swing.filechooser import FileNameExtensionFilter
-from java.awt.event import MouseAdapter
+from java.awt.event import MouseAdapter, MouseEvent
 from javax.swing.tree import DefaultMutableTreeNode
 import javax.swing
 import base64
@@ -446,6 +446,24 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab):
                 row = table.rowAtPoint(event.getPoint())
                 col = table.columnAtPoint(event.getPoint())
                 
+                # Handle right click
+                if event.getButton() == MouseEvent.BUTTON3 and row >= 0:  # BUTTON3 is right click
+                    # Get actual row index (accounting for sorting/filtering)
+                    model_row = table.convertRowIndexToModel(row)
+                    if model_row < len(self.extender.table_model.visible_rows):
+                        row_type, endpoint = self.extender.table_model.visible_rows[model_row]
+                        
+                        # Create popup menu
+                        popup = JPopupMenu()
+                        deleteItem = JMenuItem("Delete endpoint")
+                        deleteItem.addActionListener(lambda e: self.deleteEndpoint(endpoint, row_type))
+                        popup.add(deleteItem)
+                        
+                        # Show popup menu
+                        popup.show(event.getComponent(), event.getX(), event.getY())
+                        return
+                
+                # Handle left click (existing logic)
                 if col == 0:
                     # Clicked on endpoint column - toggle expansion
                     model_row = table.convertRowIndexToModel(row)
@@ -467,6 +485,34 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab):
                         else:
                             # For child rows, show specific endpoint details
                             self.extender._show_request_details(endpoint, user)
+
+            def deleteEndpoint(self, endpoint, row_type):
+                try:
+                    if row_type == 'base':
+                        # Delete base endpoint and all its variants
+                        variants = self.extender.table_model.endpoint_variants.get(endpoint, [endpoint])
+                        for variant in variants:
+                            # Remove from data structures
+                            if variant in self.extender.matrix:
+                                del self.extender.matrix[variant]
+                            if variant in self.extender.request_details:
+                                del self.extender.request_details[variant]
+                            if variant in self.extender.endpoints_order:
+                                self.extender.endpoints_order.remove(variant)
+                    else:
+                        # Delete specific variant only
+                        if endpoint in self.extender.matrix:
+                            del self.extender.matrix[endpoint]
+                        if endpoint in self.extender.request_details:
+                            del self.extender.request_details[endpoint]
+                        if endpoint in self.extender.endpoints_order:
+                            self.extender.endpoints_order.remove(endpoint)
+
+                    # Update the table
+                    SwingUtilities.invokeLater(lambda: self.extender._update_table_model())
+
+                except Exception as e:
+                    print("Error deleting endpoint: %s" % str(e))
         
         self.table.addMouseListener(CellClickListener(self))
         
