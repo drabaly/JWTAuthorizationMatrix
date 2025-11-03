@@ -15,11 +15,12 @@ from java.awt import BorderLayout, Color, Dimension, Font
 from javax.swing import (JPanel, JFrame, JTable, JScrollPane, JLabel, JTextArea,
                          JButton, JComboBox, Box, BoxLayout, SwingUtilities,
                          JSplitPane, JTabbedPane, JTextField, RowFilter, JCheckBox, JFileChooser, 
-                         JColorChooser, JDialog, JPopupMenu, JMenuItem, ListSelectionModel)
+                         JColorChooser, JDialog, JPopupMenu, JMenuItem, ListSelectionModel, ImageIcon)
 from javax.swing.table import AbstractTableModel, DefaultTableCellRenderer, TableRowSorter
 from javax.swing.event import DocumentListener, ListSelectionListener
 from javax.swing.filechooser import FileNameExtensionFilter
 from java.awt.event import MouseAdapter
+from javax.swing.tree import DefaultMutableTreeNode
 import javax.swing
 import base64
 import json
@@ -93,33 +94,77 @@ class ColorCellRenderer(DefaultTableCellRenderer):
 
 class JwtMatrixModel(AbstractTableModel):
     """
-    TableModel where rows = endpoints, columns = users.
+    TableModel where rows = endpoints (with expandable sub-rows for parameters), columns = users.
     First column is 'Endpoint', others are users, cell values are response code counts.
     """
     def __init__(self, extender):
         self.extender = extender
-        self.endpoints = []   # ordered list of endpoint keys
+        self.endpoints = []   # ordered list of base endpoint keys (without params)
+        self.endpoint_variants = {}  # base_endpoint -> list of full endpoints with params
         self.users = []       # ordered list of user identifiers
         self.data = defaultdict(lambda: defaultdict(lambda: defaultdict(int)))  # endpoint -> user -> code -> count
+        self.expanded_rows = set()  # set of base endpoints that are expanded
+        self.visible_rows = []  # actual rows to display (base + expanded children)
+
+    def _rebuild_visible_rows(self):
+        """Rebuild the list of visible rows based on expansion state."""
+        self.visible_rows = []
+        for base_endpoint in self.endpoints:
+            self.visible_rows.append(('base', base_endpoint))
+            if base_endpoint in self.expanded_rows:
+                # Add child rows
+                variants = self.endpoint_variants.get(base_endpoint, [])
+                for variant in sorted(variants):
+                    if variant != base_endpoint:  # Don't duplicate if no params
+                        self.visible_rows.append(('child', variant))
+
+    def toggle_expansion(self, row):
+        """Toggle expansion of a base endpoint row."""
+        if row < len(self.visible_rows):
+            row_type, endpoint = self.visible_rows[row]
+            if row_type == 'base':
+                if endpoint in self.expanded_rows:
+                    self.expanded_rows.remove(endpoint)
+                else:
+                    self.expanded_rows.add(endpoint)
+                self._rebuild_visible_rows()
+                self.fireTableDataChanged()
+                return True
+        return False
+
+    def is_expandable(self, row):
+        """Check if a row can be expanded (has variants)."""
+        if row < len(self.visible_rows):
+            row_type, endpoint = self.visible_rows[row]
+            if row_type == 'base':
+                variants = self.endpoint_variants.get(endpoint, [])
+                return len(variants) > 1 or (len(variants) == 1 and variants[0] != endpoint)
+        return False
+
+    def is_expanded(self, row):
+        """Check if a row is currently expanded."""
+        if row < len(self.visible_rows):
+            row_type, endpoint = self.visible_rows[row]
+            if row_type == 'base':
+                return endpoint in self.expanded_rows
+        return False
 
     # helpers to update data
-    def set_matrix(self, endpoints, users, data):
+    def set_matrix(self, endpoints, endpoint_variants, users, data):
         self.endpoints = endpoints
+        self.endpoint_variants = endpoint_variants
         self.users = users
         self.data = data
+        self._rebuild_visible_rows()
         self.fireTableStructureChanged()
 
     def update_cell(self, endpoint, user, response_code, inc=1):
-        if endpoint not in self.endpoints:
-            self.endpoints.append(endpoint)
-        if user not in self.users:
-            self.users.append(user)
-        self.data[endpoint][user][response_code] += inc
-        self.fireTableDataChanged()
+        # This method is not used anymore but kept for compatibility
+        pass
 
     # AbstractTableModel methods
     def getRowCount(self):
-        return len(self.endpoints)
+        return len(self.visible_rows)
 
     def getColumnCount(self):
         # first column is Endpoint
@@ -132,20 +177,48 @@ class JwtMatrixModel(AbstractTableModel):
             return self.users[col - 1]
 
     def getValueAt(self, row, col):
-        if row >= len(self.endpoints):
+        if row >= len(self.visible_rows):
             return ""
-        endpoint = self.endpoints[row]
+        
+        row_type, endpoint = self.visible_rows[row]
+        
         if col == 0:
-            return endpoint
+            # Endpoint column
+            if row_type == 'base':
+                # Check if expandable
+                if self.is_expandable(row):
+                    icon = "[-] " if self.is_expanded(row) else "[+] "
+                    return icon + endpoint
+                else:
+                    return endpoint
+            else:  # child
+                return "    " + endpoint  # Indent child rows
+        
         user = self.users[col - 1]
-        code_dict = self.data.get(endpoint, {}).get(user, {})
         
-        if not code_dict:
-            return "0"
-        
-        # Format: "200: 5, 403: 2"
-        sorted_codes = sorted(code_dict.items())
-        return ", ".join(["%s: %d" % (code, count) for code, count in sorted_codes])
+        if row_type == 'base':
+            # Aggregate data from all variants
+            variants = self.endpoint_variants.get(endpoint, [endpoint])
+            aggregated_codes = defaultdict(int)
+            for variant in variants:
+                code_dict = self.data.get(variant, {}).get(user, {})
+                for code, count in code_dict.items():
+                    aggregated_codes[code] += count
+            
+            if not aggregated_codes:
+                return "0"
+            
+            sorted_codes = sorted(aggregated_codes.items())
+            return ", ".join(["%s: %d" % (code, count) for code, count in sorted_codes])
+        else:  # child
+            # Show data for specific variant
+            code_dict = self.data.get(endpoint, {}).get(user, {})
+            
+            if not code_dict:
+                return "0"
+            
+            sorted_codes = sorted(code_dict.items())
+            return ", ".join(["%s: %d" % (code, count) for code, count in sorted_codes])
 
 class BurpExtender(IBurpExtender, IHttpListener, ITab):
     
@@ -362,13 +435,27 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab):
                 row = table.rowAtPoint(event.getPoint())
                 col = table.columnAtPoint(event.getPoint())
                 
-                # Don't process clicks on endpoint column (col 0)
+                if col == 0:
+                    # Clicked on endpoint column - toggle expansion
+                    model_row = table.convertRowIndexToModel(row)
+                    if self.extender.table_model.toggle_expansion(model_row):
+                        return  # Expansion toggled, don't show details
+                
+                # Don't process clicks on endpoint column for details
                 if col > 0 and row >= 0:
                     # Get actual row index (accounting for sorting/filtering)
                     model_row = table.convertRowIndexToModel(row)
-                    endpoint = self.extender.table_model.endpoints[model_row]
-                    user = self.extender.table_model.users[col - 1]
-                    self.extender._show_request_details(endpoint, user)
+                    if model_row < len(self.extender.table_model.visible_rows):
+                        row_type, endpoint = self.extender.table_model.visible_rows[model_row]
+                        user = self.extender.table_model.users[col - 1]
+                        
+                        # For base rows, show aggregated details
+                        if row_type == 'base':
+                            variants = self.extender.table_model.endpoint_variants.get(endpoint, [endpoint])
+                            self.extender._show_aggregated_request_details(variants, user)
+                        else:
+                            # For child rows, show specific endpoint details
+                            self.extender._show_request_details(endpoint, user)
         
         self.table.addMouseListener(CellClickListener(self))
         
@@ -656,15 +743,40 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab):
 
     def _update_table_model(self):
         # prepare ordered lists to preserve stable columns/rows
-        endpoints = list(self.endpoints_order)
+        # Group endpoints by base path (without query parameters)
+        endpoint_groups = defaultdict(list)  # base_endpoint -> list of full endpoints
+        
+        for full_endpoint in self.endpoints_order:
+            # Extract base endpoint (method + path without query params)
+            if '?' in full_endpoint:
+                base_endpoint = full_endpoint.split('?')[0]
+            else:
+                base_endpoint = full_endpoint
+            endpoint_groups[base_endpoint].append(full_endpoint)
+        
+        # Create ordered list of base endpoints
+        base_endpoints = []
+        seen = set()
+        for full_endpoint in self.endpoints_order:
+            if '?' in full_endpoint:
+                base = full_endpoint.split('?')[0]
+            else:
+                base = full_endpoint
+            if base not in seen:
+                base_endpoints.append(base)
+                seen.add(base)
+        
         users = list(self.users_order)
-        # convert nested defaultdict to plain dict for model
+        
+        # Convert nested defaultdict to plain dict for model
         data = defaultdict(lambda: defaultdict(dict))
-        for ep in endpoints:
+        for ep in self.endpoints_order:
             for u in users:
                 data[ep][u] = dict(self.matrix.get(ep, {}).get(u, {}))
-        self.table_model.set_matrix(endpoints, users, data)
-        self.stats_label.setText("Endpoints: %d    Users: %d" % (len(endpoints), len(users)))
+        
+        self.table_model.set_matrix(base_endpoints, endpoint_groups, users, data)
+        self.stats_label.setText("Endpoints: %d (Base: %d)    Users: %d" % 
+                                (len(self.endpoints_order), len(base_endpoints), len(users)))
         # Re-apply filter after model update
         self._apply_filter()
 
@@ -793,7 +905,7 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab):
             left_panel = JPanel(BorderLayout())
             
             # Header info
-            header = JLabel("Endpoint: %s | User: %s | Total Requests: %d" % 
+            header = JLabel("<html><b>Endpoint:</b> %s<br><b>User:</b> %s<br><b>Total Requests:</b> %d</html>" % 
                           (endpoint, user, len(all_requests)))
             left_panel.add(header, BorderLayout.NORTH)
             
@@ -957,6 +1069,203 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab):
         except Exception as e:
             import traceback
             print("Error showing request details: %s" % str(e))
+            traceback.print_exc()
+
+    def _show_aggregated_request_details(self, endpoint_variants, user):
+        """Show aggregated request details for multiple endpoint variants."""
+        try:
+            # Collect all IHttpRequestResponse objects from all variants
+            all_requests = []
+            for endpoint in endpoint_variants:
+                code_dict = self.request_details.get(endpoint, {}).get(user, {})
+                for response_code in sorted(code_dict.keys()):
+                    for http_message in code_dict[response_code]:
+                        all_requests.append(http_message)
+            
+            if not all_requests:
+                return
+            
+            # Use the base endpoint name for the dialog title
+            base_endpoint = endpoint_variants[0].split('?')[0] if endpoint_variants else "Unknown"
+            
+            # Create dialog
+            dialog = JDialog(SwingUtilities.getWindowAncestor(self._panel), "Request Details", False)
+            dialog.setSize(1200, 800)
+            dialog.setLocationRelativeTo(self._panel)
+            
+            # Create main split pane
+            main_split = JSplitPane(JSplitPane.HORIZONTAL_SPLIT)
+            
+            # Left side: List of requests
+            left_panel = JPanel(BorderLayout())
+            
+            # Header info
+            header = JLabel("<html><b>Endpoint:</b> %s (all variants)<br><b>User:</b> %s<br><b>Total Requests:</b> %d</html>" % 
+                          (base_endpoint, user, len(all_requests)))
+            left_panel.add(header, BorderLayout.NORTH)
+            
+            # Create table model for requests list
+            column_names = ["#", "Response Code", "Method", "Query"]
+            data = []
+            
+            for i, http_message in enumerate(all_requests):
+                analyzed_req = self._helpers.analyzeRequest(http_message)
+                headers = analyzed_req.getHeaders()
+                url = analyzed_req.getUrl()
+                method = headers[0].split(' ')[0] if headers and len(headers)>0 else "GET"
+                query = url.getQuery() if url.getQuery() else ""
+                
+                response = http_message.getResponse()
+                if response:
+                    analyzed_resp = self._helpers.analyzeResponse(response)
+                    response_code = str(analyzed_resp.getStatusCode())
+                else:
+                    response_code = "N/A"
+                
+                data.append([str(i + 1), response_code, method, query])
+            
+            # Create table
+            from javax.swing.table import DefaultTableModel
+            table_model = DefaultTableModel(data, column_names)
+            requests_table = JTable(table_model)
+            requests_table.setSelectionMode(ListSelectionModel.SINGLE_SELECTION)
+            
+            # Create message editor controller
+            message_controller = RequestDetailsController(self, all_requests)
+            
+            # Create request/response viewers
+            request_viewer = self._callbacks.createMessageEditor(message_controller, False)
+            response_viewer = self._callbacks.createMessageEditor(message_controller, False)
+            
+            # Right side: Request/Response viewers
+            right_split = JSplitPane(JSplitPane.VERTICAL_SPLIT)
+            
+            request_panel = JPanel(BorderLayout())
+            request_panel.add(JLabel("Request"), BorderLayout.NORTH)
+            request_panel.add(request_viewer.getComponent(), BorderLayout.CENTER)
+            
+            response_panel = JPanel(BorderLayout())
+            response_panel.add(JLabel("Response"), BorderLayout.NORTH)
+            response_panel.add(response_viewer.getComponent(), BorderLayout.CENTER)
+            
+            right_split.setTopComponent(request_panel)
+            right_split.setBottomComponent(response_panel)
+            right_split.setDividerLocation(400)
+            
+            # Selection listener for the table
+            class RequestSelectionListener(ListSelectionListener):
+                def __init__(self, controller, req_viewer, resp_viewer, requests):
+                    self.controller = controller
+                    self.req_viewer = req_viewer
+                    self.resp_viewer = resp_viewer
+                    self.requests = requests
+                
+                def valueChanged(self, e):
+                    if not e.getValueIsAdjusting():
+                        table = e.getSource()
+                        selected_row = table.getMinSelectionIndex()
+                        if selected_row >= 0:
+                            http_message = self.requests[selected_row]
+                            self.controller.setCurrentMessage(http_message)
+                            self.req_viewer.setMessage(http_message.getRequest(), True)
+                            response = http_message.getResponse()
+                            if response:
+                                self.resp_viewer.setMessage(response, False)
+                            else:
+                                self.resp_viewer.setMessage(None, False)
+            
+            requests_table.getSelectionModel().addListSelectionListener(
+                RequestSelectionListener(message_controller, request_viewer, response_viewer, all_requests))
+            
+            # Right-click menu for sending to other tools
+            class RequestTableMouseListener(MouseAdapter):
+                def __init__(self, extender, requests):
+                    self.extender = extender
+                    self.requests = requests
+                
+                def mousePressed(self, e):
+                    self.maybeShowPopup(e)
+                
+                def mouseReleased(self, e):
+                    self.maybeShowPopup(e)
+                
+                def maybeShowPopup(self, e):
+                    if e.isPopupTrigger():
+                        table = e.getSource()
+                        row = table.rowAtPoint(e.getPoint())
+                        if row >= 0:
+                            table.setRowSelectionInterval(row, row)
+                            http_message = self.requests[row]
+                            popup = self.createPopupMenu(http_message)
+                            popup.show(e.getComponent(), e.getX(), e.getY())
+                
+                def createPopupMenu(self, http_message):
+                    popup = JPopupMenu()
+                    
+                    send_to_repeater = JMenuItem("Send to Repeater")
+                    send_to_repeater.addActionListener(lambda e: self.sendToRepeater(http_message))
+                    popup.add(send_to_repeater)
+                    
+                    send_to_intruder = JMenuItem("Send to Intruder")
+                    send_to_intruder.addActionListener(lambda e: self.sendToIntruder(http_message))
+                    popup.add(send_to_intruder)
+                    
+                    send_to_comparer = JMenuItem("Send to Comparer")
+                    send_to_comparer.addActionListener(lambda e: self.sendToComparer(http_message))
+                    popup.add(send_to_comparer)
+                    
+                    return popup
+                
+                def sendToRepeater(self, http_message):
+                    analyzed = self.extender._helpers.analyzeRequest(http_message)
+                    url = analyzed.getUrl()
+                    self.extender._callbacks.sendToRepeater(
+                        url.getHost(),
+                        url.getPort(),
+                        url.getProtocol() == "https",
+                        http_message.getRequest(),
+                        None
+                    )
+                    print("Sent request to Repeater")
+                
+                def sendToIntruder(self, http_message):
+                    analyzed = self.extender._helpers.analyzeRequest(http_message)
+                    url = analyzed.getUrl()
+                    self.extender._callbacks.sendToIntruder(
+                        url.getHost(),
+                        url.getPort(),
+                        url.getProtocol() == "https",
+                        http_message.getRequest()
+                    )
+                    print("Sent request to Intruder")
+                
+                def sendToComparer(self, http_message):
+                    self.extender._callbacks.sendToComparer(http_message.getRequest())
+                    print("Sent request to Comparer")
+            
+            requests_table.addMouseListener(RequestTableMouseListener(self, all_requests))
+            
+            # Add table to scroll pane
+            scroll = JScrollPane(requests_table)
+            left_panel.add(scroll, BorderLayout.CENTER)
+            
+            # Set up split pane
+            main_split.setLeftComponent(left_panel)
+            main_split.setRightComponent(right_split)
+            main_split.setDividerLocation(300)
+            
+            # Show dialog
+            dialog.setContentPane(main_split)
+            
+            # Select first request by default
+            if len(all_requests) > 0:
+                requests_table.setRowSelectionInterval(0, 0)
+            
+            dialog.setVisible(True)
+            
+        except Exception as e:
+            import traceback
+            print("Error showing aggregated request details: %s" % str(e))
             traceback.print_exc()
 
     def _on_export_csv(self, event=None):
