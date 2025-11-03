@@ -16,7 +16,7 @@ from javax.swing import (JPanel, JFrame, JTable, JScrollPane, JLabel, JTextArea,
                          JButton, JComboBox, Box, BoxLayout, SwingUtilities,
                          JSplitPane, JTabbedPane, JTextField, RowFilter, JCheckBox, JFileChooser, 
                          JColorChooser, JDialog, JPopupMenu, JMenuItem, ListSelectionModel, ImageIcon)
-from javax.swing.table import AbstractTableModel, DefaultTableCellRenderer, TableRowSorter
+from javax.swing.table import AbstractTableModel, DefaultTableCellRenderer, TableRowSorter, DefaultTableModel
 from javax.swing.event import DocumentListener, ListSelectionListener
 from javax.swing.filechooser import FileNameExtensionFilter
 from java.awt.event import MouseAdapter
@@ -875,398 +875,122 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab):
             print("Error rebuilding matrix tab: %s" % str(e))
 
     def _show_request_details(self, endpoint, user):
-        """Show a dialog with details of all requests for a specific endpoint/user combination."""
-        try:
-            # Get all request details for this endpoint/user
-            code_dict = self.request_details.get(endpoint, {}).get(user, {})
-            
-            if not code_dict:
-                # No requests found
-                return
-            
-            # Collect all IHttpRequestResponse objects
-            all_requests = []
-            for response_code in sorted(code_dict.keys()):
-                for http_message in code_dict[response_code]:
-                    all_requests.append(http_message)
-            
-            if not all_requests:
-                return
-            
-            # Create dialog
-            dialog = JDialog(SwingUtilities.getWindowAncestor(self._panel), "Request Details", False)
-            dialog.setSize(1200, 800)
-            dialog.setLocationRelativeTo(self._panel)
-            
-            # Create main split pane
-            main_split = JSplitPane(JSplitPane.HORIZONTAL_SPLIT)
-            
-            # Left side: List of requests
-            left_panel = JPanel(BorderLayout())
-            
-            # Header info
-            header = JLabel("Endpoint: %s User: %s Total Requests: %d" % 
-                          (endpoint, user, len(all_requests)))
-            left_panel.add(header, BorderLayout.NORTH)
-            
-            # Create table model for requests list
-            column_names = ["#", "Response Code", "Method"]
-            data = []
-            
-            for i, http_message in enumerate(all_requests):
-                analyzed_req = self._helpers.analyzeRequest(http_message)
-                headers = analyzed_req.getHeaders()
-                method = headers[0].split(' ')[0] if headers and len(headers)>0 else "GET"
-                
-                response = http_message.getResponse()
-                if response:
-                    analyzed_resp = self._helpers.analyzeResponse(response)
-                    response_code = str(analyzed_resp.getStatusCode())
-                else:
-                    response_code = "N/A"
-                
-                data.append([str(i + 1), response_code, method])
-            
-            # Create table
-            from javax.swing.table import DefaultTableModel
-            table_model = DefaultTableModel(data, column_names)
-            requests_table = JTable(table_model)
-            requests_table.setSelectionMode(ListSelectionModel.SINGLE_SELECTION)
-            
-            # Create message editor controller
-            message_controller = RequestDetailsController(self, all_requests)
-            
-            # Create request/response viewers
-            request_viewer = self._callbacks.createMessageEditor(message_controller, False)
-            response_viewer = self._callbacks.createMessageEditor(message_controller, False)
-            
-            # Right side: Request/Response viewers
-            right_split = JSplitPane(JSplitPane.VERTICAL_SPLIT)
-            
-            request_panel = JPanel(BorderLayout())
-            request_panel.add(JLabel("Request"), BorderLayout.NORTH)
-            request_panel.add(request_viewer.getComponent(), BorderLayout.CENTER)
-            
-            response_panel = JPanel(BorderLayout())
-            response_panel.add(JLabel("Response"), BorderLayout.NORTH)
-            response_panel.add(response_viewer.getComponent(), BorderLayout.CENTER)
-            
-            right_split.setTopComponent(request_panel)
-            right_split.setBottomComponent(response_panel)
-            right_split.setDividerLocation(400)
-            
-            # Selection listener for the table
-            class RequestSelectionListener(ListSelectionListener):
-                def __init__(self, controller, req_viewer, resp_viewer, requests):
-                    self.controller = controller
-                    self.req_viewer = req_viewer
-                    self.resp_viewer = resp_viewer
-                    self.requests = requests
-                
-                def valueChanged(self, e):
-                    if not e.getValueIsAdjusting():
-                        table = e.getSource()
-                        selected_row = table.getMinSelectionIndex()
-                        if selected_row >= 0:
-                            http_message = self.requests[selected_row]
-                            self.controller.setCurrentMessage(http_message)
-                            self.req_viewer.setMessage(http_message.getRequest(), True)
-                            response = http_message.getResponse()
-                            if response:
-                                self.resp_viewer.setMessage(response, False)
-                            else:
-                                self.resp_viewer.setMessage(None, False)
-            
-            requests_table.getSelectionModel().addListSelectionListener(
-                RequestSelectionListener(message_controller, request_viewer, response_viewer, all_requests))
-            
-            # Right-click menu for sending to other tools
-            class RequestTableMouseListener(MouseAdapter):
-                def __init__(self, extender, requests):
-                    self.extender = extender
-                    self.requests = requests
-                
-                def mousePressed(self, e):
-                    self.maybeShowPopup(e)
-                
-                def mouseReleased(self, e):
-                    self.maybeShowPopup(e)
-                
-                def maybeShowPopup(self, e):
-                    if e.isPopupTrigger():
-                        table = e.getSource()
-                        row = table.rowAtPoint(e.getPoint())
-                        if row >= 0:
-                            table.setRowSelectionInterval(row, row)
-                            http_message = self.requests[row]
-                            popup = self.createPopupMenu(http_message)
-                            popup.show(e.getComponent(), e.getX(), e.getY())
-                
-                def createPopupMenu(self, http_message):
-                    popup = JPopupMenu()
-                    
-                    send_to_repeater = JMenuItem("Send to Repeater")
-                    send_to_repeater.addActionListener(lambda e: self.sendToRepeater(http_message))
-                    popup.add(send_to_repeater)
-                    
-                    send_to_intruder = JMenuItem("Send to Intruder")
-                    send_to_intruder.addActionListener(lambda e: self.sendToIntruder(http_message))
-                    popup.add(send_to_intruder)
-                    
-                    send_to_comparer = JMenuItem("Send to Comparer")
-                    send_to_comparer.addActionListener(lambda e: self.sendToComparer(http_message))
-                    popup.add(send_to_comparer)
-                    
-                    return popup
-                
-                def sendToRepeater(self, http_message):
-                    analyzed = self.extender._helpers.analyzeRequest(http_message)
-                    url = analyzed.getUrl()
-                    self.extender._callbacks.sendToRepeater(
-                        url.getHost(),
-                        url.getPort(),
-                        url.getProtocol() == "https",
-                        http_message.getRequest(),
-                        None
-                    )
-                    print("Sent request to Repeater")
-                
-                def sendToIntruder(self, http_message):
-                    analyzed = self.extender._helpers.analyzeRequest(http_message)
-                    url = analyzed.getUrl()
-                    self.extender._callbacks.sendToIntruder(
-                        url.getHost(),
-                        url.getPort(),
-                        url.getProtocol() == "https",
-                        http_message.getRequest()
-                    )
-                    print("Sent request to Intruder")
-                
-                def sendToComparer(self, http_message):
-                    self.extender._callbacks.sendToComparer(http_message.getRequest())
-                    print("Sent request to Comparer")
-            
-            requests_table.addMouseListener(RequestTableMouseListener(self, all_requests))
-            
-            # Add table to scroll pane
-            scroll = JScrollPane(requests_table)
-            left_panel.add(scroll, BorderLayout.CENTER)
-            
-            # Set up split pane
-            main_split.setLeftComponent(left_panel)
-            main_split.setRightComponent(right_split)
-            main_split.setDividerLocation(300)
-            
-            # Show dialog
-            dialog.setContentPane(main_split)
-            
-            # Select first request by default
-            if len(all_requests) > 0:
-                requests_table.setRowSelectionInterval(0, 0)
-            
-            dialog.setVisible(True)
-            
-        except Exception as e:
-            import traceback
-            print("Error showing request details: %s" % str(e))
-            traceback.print_exc()
+        """Show details for requests at a specific endpoint/user combination."""
+        dialog = JFrame("Requests for %s - User: %s" % (endpoint, user))
+        dialog.setSize(800, 600)
+        
+        # Create main split pane
+        mainSplitPane = JSplitPane(JSplitPane.VERTICAL_SPLIT)
+        mainSplitPane.setResizeWeight(0.3) # Give 30% to top component
+        
+        # Create request list panel
+        requests = []
+        for code in self.request_details[endpoint][user]:
+            requests.extend(self.request_details[endpoint][user][code])
+        
+        # Create table model for requests
+        request_table = JTable(DefaultTableModel(
+            [[str(i+1), r.getHttpService().getHost(), 
+              self._helpers.analyzeResponse(r.getResponse()).getStatusCode()] 
+             for i,r in enumerate(requests)],
+            ["#", "Host", "Status"]))
+        
+        request_table.setSelectionMode(ListSelectionModel.SINGLE_SELECTION)
+        list_scroll = JScrollPane(request_table)
+        
+        # Create request/response viewers
+        controller = RequestDetailsController(self, requests)
+        req_viewer = self._callbacks.createMessageEditor(controller, False)
+        resp_viewer = self._callbacks.createMessageEditor(controller, False)
+        
+        # Create viewer split pane
+        viewerSplitPane = JSplitPane(JSplitPane.HORIZONTAL_SPLIT)
+        viewerSplitPane.setResizeWeight(0.5) # Equal split
+        viewerSplitPane.setLeftComponent(req_viewer.getComponent())
+        viewerSplitPane.setRightComponent(resp_viewer.getComponent())
+        
+        # Add components to main split pane
+        mainSplitPane.setTopComponent(list_scroll)
+        mainSplitPane.setBottomComponent(viewerSplitPane)
+        
+        # Add selection listener
+        def selection_changed(event):
+            if not event.getValueIsAdjusting():
+                row = request_table.getSelectedRow()
+                if row >= 0:
+                    req_viewer.setMessage(requests[row].getRequest(), True)
+                    resp_viewer.setMessage(requests[row].getResponse(), False)
+        
+        request_table.getSelectionModel().addListSelectionListener(selection_changed)
+        
+        # Select first row by default
+        if len(requests) > 0:
+            request_table.setRowSelectionInterval(0, 0)
+        
+        # Add to dialog with proper layout
+        dialog.add(mainSplitPane)
+        dialog.setDefaultCloseOperation(JFrame.DISPOSE_ON_CLOSE)
+        dialog.setVisible(True)
 
     def _show_aggregated_request_details(self, endpoint_variants, user):
-        """Show aggregated request details for multiple endpoint variants."""
-        try:
-            # Collect all IHttpRequestResponse objects from all variants
-            all_requests = []
-            for endpoint in endpoint_variants:
-                code_dict = self.request_details.get(endpoint, {}).get(user, {})
-                for response_code in sorted(code_dict.keys()):
-                    for http_message in code_dict[response_code]:
-                        all_requests.append(http_message)
-            
-            if not all_requests:
-                return
-            
-            # Use the base endpoint name for the dialog title
-            base_endpoint = endpoint_variants[0].split('?')[0] if endpoint_variants else "Unknown"
-            
-            # Create dialog
-            dialog = JDialog(SwingUtilities.getWindowAncestor(self._panel), "Request Details", False)
-            dialog.setSize(1200, 800)
-            dialog.setLocationRelativeTo(self._panel)
-            
-            # Create main split pane
-            main_split = JSplitPane(JSplitPane.HORIZONTAL_SPLIT)
-            
-            # Left side: List of requests
-            left_panel = JPanel(BorderLayout())
-            
-            # Header info
-            header = JLabel("Endpoint: %s (all variants) User: %s Total Requests: %d" % 
-                          (base_endpoint, user, len(all_requests)))
-            left_panel.add(header, BorderLayout.NORTH)
-            
-            # Create table model for requests list
-            column_names = ["#", "Response Code", "Method", "Query"]
-            data = []
-            
-            for i, http_message in enumerate(all_requests):
-                analyzed_req = self._helpers.analyzeRequest(http_message)
-                headers = analyzed_req.getHeaders()
-                url = analyzed_req.getUrl()
-                method = headers[0].split(' ')[0] if headers and len(headers)>0 else "GET"
-                query = url.getQuery() if url.getQuery() else ""
-                
-                response = http_message.getResponse()
-                if response:
-                    analyzed_resp = self._helpers.analyzeResponse(response)
-                    response_code = str(analyzed_resp.getStatusCode())
-                else:
-                    response_code = "N/A"
-                
-                data.append([str(i + 1), response_code, method, query])
-            
-            # Create table
-            from javax.swing.table import DefaultTableModel
-            table_model = DefaultTableModel(data, column_names)
-            requests_table = JTable(table_model)
-            requests_table.setSelectionMode(ListSelectionModel.SINGLE_SELECTION)
-            
-            # Create message editor controller
-            message_controller = RequestDetailsController(self, all_requests)
-            
-            # Create request/response viewers
-            request_viewer = self._callbacks.createMessageEditor(message_controller, False)
-            response_viewer = self._callbacks.createMessageEditor(message_controller, False)
-            
-            # Right side: Request/Response viewers
-            right_split = JSplitPane(JSplitPane.VERTICAL_SPLIT)
-            
-            request_panel = JPanel(BorderLayout())
-            request_panel.add(JLabel("Request"), BorderLayout.NORTH)
-            request_panel.add(request_viewer.getComponent(), BorderLayout.CENTER)
-            
-            response_panel = JPanel(BorderLayout())
-            response_panel.add(JLabel("Response"), BorderLayout.NORTH)
-            response_panel.add(response_viewer.getComponent(), BorderLayout.CENTER)
-            
-            right_split.setTopComponent(request_panel)
-            right_split.setBottomComponent(response_panel)
-            right_split.setDividerLocation(400)
-            
-            # Selection listener for the table
-            class RequestSelectionListener(ListSelectionListener):
-                def __init__(self, controller, req_viewer, resp_viewer, requests):
-                    self.controller = controller
-                    self.req_viewer = req_viewer
-                    self.resp_viewer = resp_viewer
-                    self.requests = requests
-                
-                def valueChanged(self, e):
-                    if not e.getValueIsAdjusting():
-                        table = e.getSource()
-                        selected_row = table.getMinSelectionIndex()
-                        if selected_row >= 0:
-                            http_message = self.requests[selected_row]
-                            self.controller.setCurrentMessage(http_message)
-                            self.req_viewer.setMessage(http_message.getRequest(), True)
-                            response = http_message.getResponse()
-                            if response:
-                                self.resp_viewer.setMessage(response, False)
-                            else:
-                                self.resp_viewer.setMessage(None, False)
-            
-            requests_table.getSelectionModel().addListSelectionListener(
-                RequestSelectionListener(message_controller, request_viewer, response_viewer, all_requests))
-            
-            # Right-click menu for sending to other tools
-            class RequestTableMouseListener(MouseAdapter):
-                def __init__(self, extender, requests):
-                    self.extender = extender
-                    self.requests = requests
-                
-                def mousePressed(self, e):
-                    self.maybeShowPopup(e)
-                
-                def mouseReleased(self, e):
-                    self.maybeShowPopup(e)
-                
-                def maybeShowPopup(self, e):
-                    if e.isPopupTrigger():
-                        table = e.getSource()
-                        row = table.rowAtPoint(e.getPoint())
-                        if row >= 0:
-                            table.setRowSelectionInterval(row, row)
-                            http_message = self.requests[row]
-                            popup = self.createPopupMenu(http_message)
-                            popup.show(e.getComponent(), e.getX(), e.getY())
-                
-                def createPopupMenu(self, http_message):
-                    popup = JPopupMenu()
-                    
-                    send_to_repeater = JMenuItem("Send to Repeater")
-                    send_to_repeater.addActionListener(lambda e: self.sendToRepeater(http_message))
-                    popup.add(send_to_repeater)
-                    
-                    send_to_intruder = JMenuItem("Send to Intruder")
-                    send_to_intruder.addActionListener(lambda e: self.sendToIntruder(http_message))
-                    popup.add(send_to_intruder)
-                    
-                    send_to_comparer = JMenuItem("Send to Comparer")
-                    send_to_comparer.addActionListener(lambda e: self.sendToComparer(http_message))
-                    popup.add(send_to_comparer)
-                    
-                    return popup
-                
-                def sendToRepeater(self, http_message):
-                    analyzed = self.extender._helpers.analyzeRequest(http_message)
-                    url = analyzed.getUrl()
-                    self.extender._callbacks.sendToRepeater(
-                        url.getHost(),
-                        url.getPort(),
-                        url.getProtocol() == "https",
-                        http_message.getRequest(),
-                        None
-                    )
-                    print("Sent request to Repeater")
-                
-                def sendToIntruder(self, http_message):
-                    analyzed = self.extender._helpers.analyzeRequest(http_message)
-                    url = analyzed.getUrl()
-                    self.extender._callbacks.sendToIntruder(
-                        url.getHost(),
-                        url.getPort(),
-                        url.getProtocol() == "https",
-                        http_message.getRequest()
-                    )
-                    print("Sent request to Intruder")
-                
-                def sendToComparer(self, http_message):
-                    self.extender._callbacks.sendToComparer(http_message.getRequest())
-                    print("Sent request to Comparer")
-            
-            requests_table.addMouseListener(RequestTableMouseListener(self, all_requests))
-            
-            # Add table to scroll pane
-            scroll = JScrollPane(requests_table)
-            left_panel.add(scroll, BorderLayout.CENTER)
-            
-            # Set up split pane
-            main_split.setLeftComponent(left_panel)
-            main_split.setRightComponent(right_split)
-            main_split.setDividerLocation(300)
-            
-            # Show dialog
-            dialog.setContentPane(main_split)
-            
-            # Select first request by default
-            if len(all_requests) > 0:
-                requests_table.setRowSelectionInterval(0, 0)
-            
-            dialog.setVisible(True)
-            
-        except Exception as e:
-            import traceback
-            print("Error showing aggregated request details: %s" % str(e))
-            traceback.print_exc()
+        """Show details for requests across multiple endpoint variants for a user."""
+        dialog = JFrame("Requests for %d endpoints - User: %s" % (len(endpoint_variants), user))
+        dialog.setSize(800, 600)
+        
+        # Create main split pane
+        mainSplitPane = JSplitPane(JSplitPane.VERTICAL_SPLIT)
+        mainSplitPane.setResizeWeight(0.3)
+        
+        # Collect all requests
+        all_requests = []
+        for endpoint in endpoint_variants:
+            for code in self.request_details[endpoint][user]:
+                all_requests.extend(self.request_details[endpoint][user][code])
+        
+        # Create table model
+        request_table = JTable(DefaultTableModel(
+            [[str(i+1), r.getHttpService().getHost(),
+              self._helpers.analyzeRequest(r).getUrl().getPath(),
+              self._helpers.analyzeResponse(r.getResponse()).getStatusCode()]
+             for i,r in enumerate(all_requests)],
+            ["#", "Host", "Path", "Status"]))
+        
+        request_table.setSelectionMode(ListSelectionModel.SINGLE_SELECTION)
+        list_scroll = JScrollPane(request_table)
+        
+        # Create request/response viewers
+        controller = RequestDetailsController(self, all_requests)
+        req_viewer = self._callbacks.createMessageEditor(controller, False)
+        resp_viewer = self._callbacks.createMessageEditor(controller, False)
+        
+        # Create viewer split pane
+        viewerSplitPane = JSplitPane(JSplitPane.HORIZONTAL_SPLIT)
+        viewerSplitPane.setResizeWeight(0.5)
+        viewerSplitPane.setLeftComponent(req_viewer.getComponent())
+        viewerSplitPane.setRightComponent(resp_viewer.getComponent())
+        
+        # Add components to main split pane
+        mainSplitPane.setTopComponent(list_scroll)
+        mainSplitPane.setBottomComponent(viewerSplitPane)
+        
+        # Add selection listener
+        def selection_changed(event):
+            if not event.getValueIsAdjusting():
+                row = request_table.getSelectedRow()
+                if row >= 0:
+                    req_viewer.setMessage(all_requests[row].getRequest(), True)
+                    resp_viewer.setMessage(all_requests[row].getResponse(), False)
+        
+        request_table.getSelectionModel().addListSelectionListener(selection_changed)
+        
+        # Select first row by default
+        if len(all_requests) > 0:
+            request_table.setRowSelectionInterval(0, 0)
+        
+        # Add to dialog with proper layout
+        dialog.add(mainSplitPane)
+        dialog.setDefaultCloseOperation(JFrame.DISPOSE_ON_CLOSE)
+        dialog.setVisible(True)
 
     def _on_export_csv(self, event=None):
         """Export the matrix to CSV format."""
