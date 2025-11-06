@@ -1066,28 +1066,28 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab):
                                         # Add cookie header if it doesn't exist
                                         new_headers.append("Cookie: %s=%s" % (cookie_name, token))
                             
-                            # Build new request
-                            body = req.getRequest()[analyzed_req.getBodyOffset():]
-                            new_request = self.extender._helpers.buildHttpMessage(new_headers, body)
+                                # Build new request
+                                body = req.getRequest()[analyzed_req.getBodyOffset():]
+                                new_request = self.extender._helpers.buildHttpMessage(new_headers, body)
                             
-                            # Make request
-                            try:
-                                response = self.extender._callbacks.makeHttpRequest(
-                                    req.getHttpService(),
-                                    new_request
-                                )
-                                
-                                # Process response
-                                if response is not None:
-                                    analyzed_resp = self.extender._helpers.analyzeResponse(response.getResponse())
-                                    response_code = str(analyzed_resp.getStatusCode())
+                                # Make request
+                                try:
+                                    response = self.extender._callbacks.makeHttpRequest(
+                                        req.getHttpService(),
+                                        new_request
+                                    )
                                     
-                                    # Update replay matrix
-                                    self.extender.replay_matrix[endpoint][user][response_code] += 1
-                                    self.extender.replay_request_details[endpoint][user][response_code].append(response)
+                                    # Process response
+                                    if response is not None:
+                                        analyzed_resp = self.extender._helpers.analyzeResponse(response.getResponse())
+                                        response_code = str(analyzed_resp.getStatusCode())
+                                        
+                                        # Update replay matrix
+                                        self.extender.replay_matrix[endpoint][user][response_code] += 1
+                                        self.extender.replay_request_details[endpoint][user][response_code].append(response)
                             
-                            except Exception as e:
-                                print("Error replaying request to %s with user %s: %s" % (endpoint, user, str(e)))
+                                except Exception as e:
+                                    print("Error replaying request to %s with user %s: %s" % (endpoint, user, str(e)))
         
                     finally:
                         # Close progress dialog on EDT
