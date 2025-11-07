@@ -725,7 +725,7 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab):
         config_panel.add(Box.createVerticalStrut(10))
         
         parse_button = JButton("Parse Proxy History and Build Matrix", actionPerformed=self._on_parse_proxy_history)
-        parse_button.setMaximumSize(Dimension(300, 30))
+        parse_button.setMaximumSize(Dimension(500, 30))
         parse_button.setAlignmentX(0.0)
         config_panel.add(parse_button)
         
@@ -891,18 +891,34 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab):
                     analyzed_resp = self._helpers.analyzeResponse(response)
                     response_code = str(analyzed_resp.getStatusCode())
                     
-                    # find Authorization header
-                    auth_header = None
-                    for h in headers:
-                        if h.lower().startswith("authorization:"):
-                            auth_header = h
-                            break
-                    if not auth_header:
+                    # Find JWT token based on configured location
+                    token = None
+                    if self.jwt_location_auth.isSelected():
+                        # Look in Authorization header
+                        for h in headers:
+                            if h.lower().startswith("authorization:"):
+                                parts = h.split(":",1)[1].strip().split()
+                                if len(parts) >= 2 and parts[0].lower() == "bearer":
+                                    token = parts[1].strip()
+                                    break
+                    else:
+                        # Look in Cookies
+                        cookie_name = self.cookie_name_field.getText().strip() or "jwt"
+                        for h in headers:
+                            if h.lower().startswith("cookie:"):
+                                cookies = h.split(":",1)[1].strip().split(";")
+                                for cookie in cookies:
+                                    if "=" in cookie:
+                                        name, value = cookie.split("=", 1)
+                                        if name.strip() == cookie_name:
+                                            token = value.strip()
+                                            break
+                                if token:
+                                    break
+                
+                    if not token:
                         continue
-                    parts = auth_header.split(":",1)[1].strip().split()
-                    if len(parts) < 2:
-                        continue
-                    token = parts[1].strip()
+
                     user = self._parse_jwt_get_field(token, self.jwt_user_field)
                     if user is None:
                         user = "<no-%s>" % self.jwt_user_field
@@ -930,7 +946,39 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab):
         filter_panel = JPanel(BorderLayout())
         filter_panel.add(JLabel("Filter endpoints: "), BorderLayout.WEST)
         self.replay_filter_field = JTextField()
-        self.replay_filter_field.getDocument().addDocumentListener(FilterListener(self))
+
+        # Create custom FilterListener for replay matrix
+        class ReplayFilterListener(DocumentListener):
+            def __init__(self, extender):
+                self.extender = extender
+            
+            def insertUpdate(self, e):
+                self._apply_replay_filter()
+            
+            def removeUpdate(self, e):
+                self._apply_replay_filter()
+            
+            def changedUpdate(self, e):
+                self._apply_replay_filter()
+            
+            def _apply_replay_filter(self):
+                try:
+                    filter_text = self.extender.replay_filter_field.getText().strip()
+                    if not filter_text:
+                        # No filter, show all rows
+                        self.extender.replay_table_sorter.setRowFilter(None)
+                    else:
+                        # Create a case-insensitive regex filter for the endpoint column
+                        self.extender.replay_table_sorter.setRowFilter(
+                            RowFilter.regexFilter("(?i)" + re.escape(filter_text), 0)
+                        )
+                except Exception as e:
+                    # If regex is invalid, show all rows
+                    print("Replay filter error: %s" % str(e))
+                    self.extender.replay_table_sorter.setRowFilter(None)
+    
+        self.replay_filter_field.getDocument().addDocumentListener(ReplayFilterListener(self))
+
         filter_panel.add(self.replay_filter_field, BorderLayout.CENTER)
         
         # Create table with same model as main matrix
@@ -1042,80 +1090,91 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab):
                     try:
                         # Replay each request
                         for req in unique_requests:
-                            analyzed_req = self.extender._helpers.analyzeRequest(req)
-                            headers = analyzed_req.getHeaders()
-                            url = analyzed_req.getUrl()
-                            method = headers[0].split(' ')[0] if headers and len(headers)>0 else "GET"
-                            endpoint = "%s %s" % (method, url.getPath() + (("?" + url.getQuery()) if url.getQuery() else ""))
+                            try:
+                                analyzed_req = self.extender._helpers.analyzeRequest(req)
+                                headers = analyzed_req.getHeaders()
+                                url = analyzed_req.getUrl()
+                                method = headers[0].split(' ')[0] if headers and len(headers)>0 else "GET"
+                                endpoint = "%s %s" % (method, url.getPath() + (("?" + url.getQuery()) if url.getQuery() else ""))
                             
-                            # Add endpoint to replay_endpoints_order immediately
-                            if endpoint not in self.extender.replay_endpoints_order:
-                                self.extender.replay_endpoints_order.append(endpoint)
+                                # Add endpoint to replay_endpoints_order immediately
+                                if endpoint not in self.extender.replay_endpoints_order:
+                                    self.extender.replay_endpoints_order.append(endpoint)
                             
-                            # For each JWT token
-                            for user, token in jwt_tokens.items():
-                                current_request += 1
-                                # Update progress on EDT
-                                SwingUtilities.invokeLater(lambda: self._update_progress(progress, current_request, total_requests))
-                                
-                                # Create new request with replaced JWT
-                                new_headers = []
-                                if self.extender.jwt_location_auth.isSelected():
-                                    # Replace Authorization header
-                                    auth_found = False
-                                    for header in headers:
-                                        if header.lower().startswith("authorization:"):
+                                # For each JWT token
+                                for user, token in jwt_tokens.items():
+                                    current_request += 1
+                                    final_current = current_request
+                                    SwingUtilities.invokeLater(lambda: self._update_progress(progress, final_current, total_requests))
+                                    # Create new request with replaced JWT
+                                    new_headers = []
+                                    if self.extender.jwt_location_auth.isSelected():
+                                        # Replace Authorization header
+                                        auth_found = False
+                                        for header in headers:
+                                            if header.lower().startswith("authorization:"):
+                                                new_headers.append("Authorization: Bearer %s" % token)
+                                                auth_found = True
+                                            else:
+                                                new_headers.append(header)
+                                        if not auth_found:
                                             new_headers.append("Authorization: Bearer %s" % token)
-                                            auth_found = True
-                                        else:
-                                            new_headers.append(header)
-                                    if not auth_found:
-                                        new_headers.append("Authorization: Bearer %s" % token)
-                                else:
-                                    # Replace Cookie
-                                    cookie_name = self.extender.cookie_name_field.getText().strip() or "jwt"
-                                    cookie_found = False
-                                    for header in headers:
-                                        if header.lower().startswith("cookie:"):
-                                            cookies = header.split(":",1)[1].strip().split(";")
-                                            new_cookies = []
-                                            for cookie in cookies:
-                                                if "=" in cookie:
-                                                    name, value = cookie.split("=", 1)
-                                                    if name.strip() == cookie_name:
-                                                        new_cookies.append("%s=%s" % (name.strip(), token))
-                                                        cookie_found = True
-                                                    else:
-                                                        new_cookies.append(cookie)
-                                            new_headers.append("Cookie: %s" % "; ".join(new_cookies))
-                                        else:
-                                            new_headers.append(header)
-                                    if not cookie_found:
-                                        # Add cookie header if it doesn't exist
-                                        new_headers.append("Cookie: %s=%s" % (cookie_name, token))
-                            
-                                # Build new request
-                                body = req.getRequest()[analyzed_req.getBodyOffset():]
-                                new_request = self.extender._helpers.buildHttpMessage(new_headers, body)
-                            
-                                # Make request
-                                try:
+                                    else:
+                                        # Replace Cookie
+                                        cookie_name = self.extender.cookie_name_field.getText().strip() or "jwt"
+                                        cookie_found = False
+                                        for header in headers:
+                                            if header.lower().startswith("cookie:"):
+                                                cookies = header.split(":",1)[1].strip().split(";")
+                                                new_cookies = []
+                                                for cookie in cookies:
+                                                    if "=" in cookie:
+                                                        name, value = cookie.split("=", 1)
+                                                        if name.strip() == cookie_name:
+                                                            new_cookies.append("%s=%s" % (name.strip(), token))
+                                                            cookie_found = True
+                                                        else:
+                                                            new_cookies.append(cookie)
+                                                new_headers.append("Cookie: %s" % "; ".join(new_cookies))
+                                            else:
+                                                new_headers.append(header)
+                                        if not cookie_found:
+                                            new_headers.append("Cookie: %s=%s" % (cookie_name, token))
+
+                                    # Build new request
+                                    body = req.getRequest()[analyzed_req.getBodyOffset():]
+                                    new_request = self.extender._helpers.buildHttpMessage(new_headers, body)
+
+                                    # Make request
                                     response = self.extender._callbacks.makeHttpRequest(
                                         req.getHttpService(),
                                         new_request
                                     )
-                                    
+
+
+                                    # Skip if makeHttpRequest returned None or no response bytes
+                                    if response is None:
+                                        print("No response received for request to %s with user %s" % (endpoint, user))
+                                        continue
+                                    resp_bytes = None
+                                    try:
+                                        resp_bytes = response.getResponse()
+                                    except:
+                                        resp_bytes = None
+                                    if resp_bytes is None:
+                                        print("No response bytes for request to %s with user %s" % (endpoint, user))
+                                        continue
+
                                     # Process response
-                                    if response is not None:
-                                        analyzed_resp = self.extender._helpers.analyzeResponse(response.getResponse())
-                                        response_code = str(analyzed_resp.getStatusCode())
-                                        
-                                        # Update replay matrix
-                                        self.extender.replay_matrix[endpoint][user][response_code] += 1
-                                        self.extender.replay_request_details[endpoint][user][response_code].append(response)
-                            
-                                except Exception as e:
-                                    print("Error replaying request to %s with user %s: %s" % (endpoint, user, str(e)))
+                                    analyzed_resp = self.extender._helpers.analyzeResponse(response.getResponse())
+                                    response_code = str(analyzed_resp.getStatusCode())
+
+                                    # Update replay matrix
+                                    self.extender.replay_matrix[endpoint][user][response_code] += 1
+                                    self.extender.replay_request_details[endpoint][user][response_code].append(response)
+                                
+                            except Exception as e:
+                                print("Error replaying request to %s with user %s: %s" % (endpoint, user, str(e)))
         
                     finally:
                         # Close progress dialog on EDT
@@ -1149,7 +1208,7 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab):
             def _update_progress(self, progress, current, total):
                 """Update progress bar (called on EDT)"""
                 progress.setValue(current)
-                progress.setString("%d/%d (%d)}\%)" % (current, total, int(current/total*100)))
+                progress.setString(str(current) + '/' + str(total) + ' (' + str(int((current*100)/total)) + '%)')
         ReplayThread(self).start()
 
     def _update_table_model(self):
@@ -1228,7 +1287,17 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab):
             (len(self.replay_endpoints_order), len(base_endpoints), len(users))
         )
         # Re-apply filter after model update
-        self._apply_filter()
+        try:
+            filter_text = self.replay_filter_field.getText().strip()
+            if not filter_text:
+                self.replay_table_sorter.setRowFilter(None)
+            else:
+                self.replay_table_sorter.setRowFilter(
+                    RowFilter.regexFilter("(?i)" + re.escape(filter_text), 0)
+                )
+        except Exception as e:
+            print("Replay filter error: %s" % str(e))
+            self.replay_table_sorter.setRowFilter(None)
 
     def _apply_filter(self):
         """Apply the filter to the table based on the filter text field."""
@@ -1339,12 +1408,14 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab):
         # Create request list panel
         requests = []
         for code in request_data[endpoint][user]:
-            requests.extend(request_data[endpoint][user][code])
+            valid_requests = [r for r in request_data[endpoint][user][code] 
+                         if r and r.getResponse() is not None]
+            requests.extend(valid_requests)
         
-        # Create table model for requests
+         # Create table model for requests with null checks
         request_table = JTable(DefaultTableModel(
             [[str(i+1), r.getHttpService().getHost(), 
-              self._helpers.analyzeResponse(r.getResponse()).getStatusCode()] 
+              self._helpers.analyzeResponse(r.getResponse()).getStatusCode() if r.getResponse() else "N/A"] 
              for i,r in enumerate(requests)],
             ["#", "Host", "Status"]))
         
@@ -1401,13 +1472,15 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab):
         all_requests = []
         for endpoint in endpoint_variants:
             for code in request_data[endpoint][user]:
-                all_requests.extend(request_data[endpoint][user][code])
+                valid_requests = [r for r in request_data[endpoint][user][code] 
+                            if r and r.getResponse() is not None]
+                all_requests.extend(valid_requests)
         
-        # Create table model
+        # Create table model with null checks
         request_table = JTable(DefaultTableModel(
             [[str(i+1), r.getHttpService().getHost(),
               self._helpers.analyzeRequest(r).getUrl().getPath(),
-              self._helpers.analyzeResponse(r.getResponse()).getStatusCode()]
+              self._helpers.analyzeResponse(r.getResponse()).getStatusCode() if r.getResponse() else "N/A"]
              for i,r in enumerate(all_requests)],
             ["#", "Host", "Path", "Status"]))
         
