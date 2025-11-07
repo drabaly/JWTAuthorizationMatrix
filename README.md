@@ -17,7 +17,7 @@ A Burp Suite extension for testing JWT (JSON Web Token) based authorization in w
 
 ## Installation
 
-1. Download and install [Jython Standalone JAR](https://www.jython.org/downloads.html)
+1. Download and install [Jython Standalone JAR](https://www.jython.org/download.html)
 2. In Burp Suite, go to `Extender` -> `Options`
 3. Under "Python Environment", set the location of your Jython standalone JAR
 4. Go to `Extender` -> `Extensions`
