@@ -944,8 +944,36 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab):
         self.replay_table.setRowHeight(30)
         self.replay_table.getTableHeader().setPreferredSize(Dimension(self.replay_table.getTableHeader().getPreferredSize().width, 25))
         
-        # Add mouse listener for cell clicks (same as main matrix)
-        self.replay_table.addMouseListener(CellClickListener(self))
+        # Add mouse listener for cell clicks
+        class ReplayCellClickListener(MouseAdapter):
+            def __init__(self, extender):
+                self.extender = extender
+            
+            def mouseClicked(self, event):
+                table = event.getSource()
+                row = table.rowAtPoint(event.getPoint())
+                col = table.columnAtPoint(event.getPoint())
+        
+                if col == 0:
+                    # Clicked on endpoint column - toggle expansion
+                    model_row = table.convertRowIndexToModel(row)
+                    if self.extender.replay_table_model.toggle_expansion(model_row):
+                        return  # Expansion toggled, don't show details
+        
+                # Don't process clicks on endpoint column for details
+                if col > 0 and row >= 0:
+                    model_row = table.convertRowIndexToModel(row)
+                    if model_row < len(self.extender.replay_table_model.visible_rows):
+                        row_type, endpoint = self.extender.replay_table_model.visible_rows[model_row]
+                        user = self.extender.replay_table_model.users[col - 1]
+
+                        if row_type == 'base':
+                            variants = self.extender.replay_table_model.endpoint_variants.get(endpoint, [endpoint])
+                            self.extender._show_aggregated_request_details(variants, user, True)  # Pass is_replay=True
+                        else:
+                            self.extender._show_request_details(endpoint, user, True)  # Pass is_replay=True
+        
+        self.replay_table.addMouseListener(ReplayCellClickListener(self))
         
         scroll = JScrollPane(self.replay_table)
         
@@ -1121,7 +1149,7 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab):
             def _update_progress(self, progress, current, total):
                 """Update progress bar (called on EDT)"""
                 progress.setValue(current)
-                progress.setString("%d/%d (%d)}%\)" % (current, total, int(current/total*100)))
+                progress.setString("%d/%d (%d)}\%)" % (current, total, int(current/total*100)))
         ReplayThread(self).start()
 
     def _update_table_model(self):
@@ -1296,9 +1324,12 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab):
         except Exception as e:
             print("Error rebuilding matrix tab: %s" % str(e))
 
-    def _show_request_details(self, endpoint, user):
+    def _show_request_details(self, endpoint, user, is_replay=False):
         """Show details for requests at a specific endpoint/user combination."""
-        dialog = JFrame("Requests for %s - User: %s" % (endpoint, user))
+        # Select correct data structure based on is_replay flag
+        request_data = self.replay_request_details if is_replay else self.request_details
+        
+        dialog = JFrame('Replay ' if is_replay else '' + 'Requests for %s - User: %s' % (endpoint, user))
         dialog.setSize(800, 600)
         
         # Create main split pane
@@ -1307,8 +1338,8 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab):
         
         # Create request list panel
         requests = []
-        for code in self.request_details[endpoint][user]:
-            requests.extend(self.request_details[endpoint][user][code])
+        for code in request_data[endpoint][user]:
+            requests.extend(request_data[endpoint][user][code])
         
         # Create table model for requests
         request_table = JTable(DefaultTableModel(
@@ -1354,9 +1385,12 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab):
         dialog.setDefaultCloseOperation(JFrame.DISPOSE_ON_CLOSE)
         dialog.setVisible(True)
 
-    def _show_aggregated_request_details(self, endpoint_variants, user):
+    def _show_aggregated_request_details(self, endpoint_variants, user, is_replay=False):
         """Show details for requests across multiple endpoint variants for a user."""
-        dialog = JFrame("Requests for %d endpoints - User: %s" % (len(endpoint_variants), user))
+        # Select correct data structure based on is_replay flag
+        request_data = self.replay_request_details if is_replay else self.request_details
+        
+        dialog = JFrame('Replay ' if is_replay else '' + "Requests for %d endpoints - User: %s" % (len(endpoint_variants), user))
         dialog.setSize(800, 600)
         
         # Create main split pane
@@ -1366,8 +1400,8 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab):
         # Collect all requests
         all_requests = []
         for endpoint in endpoint_variants:
-            for code in self.request_details[endpoint][user]:
-                all_requests.extend(self.request_details[endpoint][user][code])
+            for code in request_data[endpoint][user]:
+                all_requests.extend(request_data[endpoint][user][code])
         
         # Create table model
         request_table = JTable(DefaultTableModel(
