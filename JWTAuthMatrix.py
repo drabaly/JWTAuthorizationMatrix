@@ -1490,19 +1490,35 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab):
                         continue
                     analyzed_resp = self._helpers.analyzeResponse(response)
                     response_code = str(analyzed_resp.getStatusCode())
-                    
-                    # find Authorization header
-                    auth_header = None
-                    for h in headers:
-                        if h.lower().startswith("authorization:"):
-                            auth_header = h
-                            break
-                    if not auth_header:
+
+                    # Find JWT token based on configured location
+                    token = None
+                    if self.jwt_location_auth.isSelected():
+                        # Look in Authorization header
+                        for h in headers:
+                            if h.lower().startswith("authorization:"):
+                                parts = h.split(":",1)[1].strip().split()
+                                if len(parts) >= 2 and parts[0].lower() == "bearer":
+                                    token = parts[1].strip()
+                                    break
+                    else:
+                        # Look in Cookies
+                        cookie_name = self.cookie_name_field.getText().strip() or "jwt"
+                        for h in headers:
+                            if h.lower().startswith("cookie:"):
+                                cookies = h.split(":",1)[1].strip().split(";")
+                                for cookie in cookies:
+                                    if "=" in cookie:
+                                        name, value = cookie.split("=", 1)
+                                        if name.strip() == cookie_name:
+                                            token = value.strip()
+                                            break
+                                if token:
+                                    break
+                
+                    if not token:
                         continue
-                    parts = auth_header.split(":",1)[1].strip().split()
-                    if len(parts) < 2:
-                        continue
-                    token = parts[1].strip()
+
                     user = self._parse_jwt_get_field(token, self.jwt_user_field)
                     if user is None:
                         user = "<no-%s>" % self.jwt_user_field
