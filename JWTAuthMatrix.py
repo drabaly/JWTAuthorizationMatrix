@@ -14,6 +14,7 @@ from burp import IContextMenuFactory
 from java.lang import Object, Thread, Runnable
 from java.util.concurrent import Executors, TimeUnit, Callable
 from java.util.concurrent.atomic import AtomicInteger
+from java.util.concurrent.locks import ReentrantLock
 from java.awt import BorderLayout, Color, Dimension, Font
 from javax.swing import (JPanel, JFrame, JTable, JScrollPane, JLabel, JTextArea,
                          JButton, JComboBox, Box, BoxLayout, SwingUtilities,
@@ -228,7 +229,7 @@ class JwtMatrixModel(AbstractTableModel):
 
 class ReplayTaskCallable(Callable):
     """Callable wrapper for replaying a single request with a specific token."""
-    def __init__(self, extender, req, endpoint, user, token, headers, analyzed_req, progress, progress_counter, total_requests):
+    def __init__(self, extender, req, endpoint, user, token, headers, analyzed_req, progress, progress_counter, total_requests, replay_lock):
         self.extender = extender
         self.req = req
         self.endpoint = endpoint
@@ -239,6 +240,7 @@ class ReplayTaskCallable(Callable):
         self.progress = progress
         self.progress_counter = progress_counter
         self.total_requests = total_requests
+        self.replay_lock = replay_lock
     
     def call(self):
         """Execute the replay task."""
@@ -305,9 +307,13 @@ class ReplayTaskCallable(Callable):
                     analyzed_resp = self.extender._helpers.analyzeResponse(response.getResponse())
                     response_code = str(analyzed_resp.getStatusCode())
 
-                    # Update replay matrix (thread-safe)
-                    self.extender.replay_matrix[self.endpoint][self.user][response_code] += 1
-                    self.extender.replay_request_details[self.endpoint][self.user][response_code].append(response)
+                    # Update replay matrix (thread-safe with lock)
+                    self.replay_lock.lock()
+                    try:
+                        self.extender.replay_matrix[self.endpoint][self.user][response_code] += 1
+                        self.extender.replay_request_details[self.endpoint][self.user][response_code].append(response)
+                    finally:
+                        self.replay_lock.unlock()
         
         except Exception as e:
             print("Error replaying request to %s with user %s: %s" % (self.endpoint, self.user, str(e)))
@@ -1250,6 +1256,9 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab):
                     # Create atomic counter for thread-safe progress updates
                     progress_counter = AtomicInteger(0)
                     
+                    # Create lock for thread-safe replay matrix updates
+                    replay_lock = ReentrantLock()
+                    
                     try:
                         # Create thread pool
                         executor = Executors.newFixedThreadPool(thread_count)
@@ -1280,7 +1289,8 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab):
                                         analyzed_req,
                                         progress,
                                         progress_counter,
-                                        total_requests
+                                        total_requests,
+                                        replay_lock
                                     )
                                     tasks.append(executor.submit(task))
                             
