@@ -10,10 +10,12 @@ A Burp Suite extension for testing JWT (JSON Web Token) based authorization in w
 - Color-coded response status codes for quick analysis
 - Detailed request/response inspection for each matrix cell
 - Replay functionality to test endpoints with different JWT tokens
+- Multithreaded replay for fast endpoint testing (configurable thread count)
 - JWT token management table for tracking valid tokens
 - Proxy history parsing for retrospective analysis
 - Configurable JWT claim field for user identification
 - Request grouping by endpoint patterns
+- Multi-line selection and batch deletion of endpoints
 
 ## Installation
 
@@ -44,7 +46,8 @@ The matrix can be populated in two ways:
 
 - Click cells to view detailed requests and responses
 - Use [+] to expand grouped endpoints with parameters
-- Right-click endpoints to remove them from the matrix
+- **Select multiple rows** using Ctrl+Click or Shift+Click
+- **Right-click on selected rows** to delete multiple endpoints at once
 - Filter endpoints using the search box
 
 ### JWT Management
@@ -56,9 +59,16 @@ The matrix can be populated in two ways:
 ### Replay Testing
 
 1. Add JWT tokens to the JWT Management table
-2. Select requests to replay
+2. Optionally configure the number of replay threads (default: 5, range: 1-50)
 3. Click "Replay All Requests with JWT Tokens"
 4. View results in the Replay Matrix tab
+
+#### Replay Performance
+
+- The replay feature uses multithreading for improved performance
+- Configure thread count in the Configuration tab under "Replay Settings"
+- More threads = faster replay, but may impact system resources
+- Recommended: 5-10 threads for most systems
 
 ## Development
 
