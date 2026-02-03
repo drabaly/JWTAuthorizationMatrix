@@ -11,7 +11,9 @@ from burp import IHttpListener
 from burp import ITab
 from burp import IMessageEditorController
 from burp import IContextMenuFactory
-from java.lang import Object, Thread
+from java.lang import Object, Thread, Runnable
+from java.util.concurrent import Executors, TimeUnit, Callable
+from java.util.concurrent.atomic import AtomicInteger
 from java.awt import BorderLayout, Color, Dimension, Font
 from javax.swing import (JPanel, JFrame, JTable, JScrollPane, JLabel, JTextArea,
                          JButton, JComboBox, Box, BoxLayout, SwingUtilities,
@@ -224,6 +226,100 @@ class JwtMatrixModel(AbstractTableModel):
             sorted_codes = sorted(code_dict.items())
             return ", ".join(["%s: %d" % (code, count) for code, count in sorted_codes])
 
+class ReplayTaskCallable(Callable):
+    """Callable wrapper for replaying a single request with a specific token."""
+    def __init__(self, extender, req, endpoint, user, token, headers, analyzed_req, progress, progress_counter, total_requests):
+        self.extender = extender
+        self.req = req
+        self.endpoint = endpoint
+        self.user = user
+        self.token = token
+        self.headers = headers
+        self.analyzed_req = analyzed_req
+        self.progress = progress
+        self.progress_counter = progress_counter
+        self.total_requests = total_requests
+    
+    def call(self):
+        """Execute the replay task."""
+        try:
+            # Create new request with replaced JWT
+            new_headers = []
+            if self.extender.jwt_location_auth.isSelected():
+                # Replace Authorization header
+                auth_found = False
+                for header in self.headers:
+                    if header.lower().startswith("authorization:"):
+                        new_headers.append("Authorization: Bearer %s" % self.token)
+                        auth_found = True
+                    else:
+                        new_headers.append(header)
+                if not auth_found:
+                    new_headers.append("Authorization: Bearer %s" % self.token)
+            else:
+                # Replace Cookie
+                cookie_name = self.extender.cookie_name_field.getText().strip() or "jwt"
+                cookie_found = False
+                for header in self.headers:
+                    if header.lower().startswith("cookie:"):
+                        cookies = header.split(":",1)[1].strip().split(";")
+                        new_cookies = []
+                        for cookie in cookies:
+                            if "=" in cookie:
+                                name, value = cookie.split("=", 1)
+                                if name.strip() == cookie_name:
+                                    new_cookies.append("%s=%s" % (name.strip(), self.token))
+                                    cookie_found = True
+                                else:
+                                    new_cookies.append(cookie)
+                        new_headers.append("Cookie: %s" % "; ".join(new_cookies))
+                    else:
+                        new_headers.append(header)
+                if not cookie_found:
+                    new_headers.append("Cookie: %s=%s" % (cookie_name, self.token))
+
+            # Build new request
+            body = self.req.getRequest()[self.analyzed_req.getBodyOffset():]
+            new_request = self.extender._helpers.buildHttpMessage(new_headers, body)
+
+            # Make request
+            response = self.extender._callbacks.makeHttpRequest(
+                self.req.getHttpService(),
+                new_request
+            )
+
+            # Skip if makeHttpRequest returned None or no response bytes
+            if response is None:
+                print("No response received for request to %s with user %s" % (self.endpoint, self.user))
+            else:
+                resp_bytes = None
+                try:
+                    resp_bytes = response.getResponse()
+                except:
+                    resp_bytes = None
+                
+                if resp_bytes is None:
+                    print("No response bytes for request to %s with user %s" % (self.endpoint, self.user))
+                else:
+                    # Process response
+                    analyzed_resp = self.extender._helpers.analyzeResponse(response.getResponse())
+                    response_code = str(analyzed_resp.getStatusCode())
+
+                    # Update replay matrix (thread-safe)
+                    self.extender.replay_matrix[self.endpoint][self.user][response_code] += 1
+                    self.extender.replay_request_details[self.endpoint][self.user][response_code].append(response)
+        
+        except Exception as e:
+            print("Error replaying request to %s with user %s: %s" % (self.endpoint, self.user, str(e)))
+        
+        finally:
+            # Update progress counter
+            self.progress_counter.incrementAndGet()
+            current = self.progress_counter.get()
+            SwingUtilities.invokeLater(lambda: self.extender._update_replay_progress(self.progress, current, self.total_requests))
+        
+        return None
+
 class CellClickListener(MouseAdapter):
     def __init__(self, extender):
         self.extender = extender
@@ -235,15 +331,23 @@ class CellClickListener(MouseAdapter):
         
         # Handle right click
         if event.getButton() == MouseEvent.BUTTON3 and row >= 0:  # BUTTON3 is right click
-            # Get actual row index (accounting for sorting/filtering)
-            model_row = table.convertRowIndexToModel(row)
-            if model_row < len(self.extender.table_model.visible_rows):
-                row_type, endpoint = self.extender.table_model.visible_rows[model_row]
-                
+            # Ensure the clicked row is selected
+            if not table.isRowSelected(row):
+                table.setRowSelectionInterval(row, row)
+            
+            # Get all selected rows
+            selected_rows = table.getSelectedRows()
+            
+            if len(selected_rows) > 0:
                 # Create popup menu
                 popup = JPopupMenu()
-                deleteItem = JMenuItem("Delete endpoint")
-                deleteItem.addActionListener(lambda e: self.deleteEndpoint(endpoint, row_type))
+                
+                if len(selected_rows) == 1:
+                    deleteItem = JMenuItem("Delete endpoint")
+                else:
+                    deleteItem = JMenuItem("Delete %d endpoints" % len(selected_rows))
+                
+                deleteItem.addActionListener(lambda e: self.deleteMultipleEndpoints(table, selected_rows))
                 popup.add(deleteItem)
                 
                 # Show popup menu
@@ -273,7 +377,33 @@ class CellClickListener(MouseAdapter):
                     # For child rows, show specific endpoint details
                     self.extender._show_request_details(endpoint, user)
 
-    def deleteEndpoint(self, endpoint, row_type):
+    def deleteMultipleEndpoints(self, table, selected_rows):
+        """Delete multiple selected endpoints."""
+        try:
+            # Collect all endpoints to delete from selected rows
+            endpoints_to_delete = set()
+            row_types_to_delete = {}
+            
+            for row in selected_rows:
+                model_row = table.convertRowIndexToModel(row)
+                if model_row < len(self.extender.table_model.visible_rows):
+                    row_type, endpoint = self.extender.table_model.visible_rows[model_row]
+                    endpoints_to_delete.add(endpoint)
+                    row_types_to_delete[endpoint] = row_type
+            
+            # Delete each endpoint
+            for endpoint in endpoints_to_delete:
+                row_type = row_types_to_delete[endpoint]
+                self._delete_single_endpoint(endpoint, row_type)
+            
+            # Update the table once after all deletions
+            SwingUtilities.invokeLater(lambda: self.extender._update_table_model())
+            
+        except Exception as e:
+            print("Error deleting endpoints: %s" % str(e))
+
+    def _delete_single_endpoint(self, endpoint, row_type):
+        """Delete a single endpoint from data structures."""
         try:
             if row_type == 'base':
                 # Delete base endpoint and all its variants
@@ -294,12 +424,8 @@ class CellClickListener(MouseAdapter):
                     del self.extender.request_details[endpoint]
                 if endpoint in self.extender.endpoints_order:
                     self.extender.endpoints_order.remove(endpoint)
-
-            # Update the table
-            SwingUtilities.invokeLater(lambda: self.extender._update_table_model())
-
         except Exception as e:
-            print("Error deleting endpoint: %s" % str(e))
+            print("Error deleting single endpoint: %s" % str(e))
 
 class BurpExtender(IBurpExtender, IHttpListener, ITab):
     #
@@ -318,6 +444,9 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab):
 
         # configuration defaults
         self.jwt_user_field = "sub"
+        
+        # replay thread count setting
+        self.replay_thread_count = 5
         
         # tool listening flags (enabled by default)
         self.listen_proxy = True
@@ -531,6 +660,9 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab):
         # Increase row height for matrix table
         self.table.setRowHeight(30)  # Set default row height
         self.table.getTableHeader().setPreferredSize(Dimension(self.table.getTableHeader().getPreferredSize().width, 25))
+
+        # Enable multiple row selection
+        self.table.setSelectionMode(ListSelectionModel.MULTIPLE_INTERVAL_SELECTION)
 
         # Add mouse listener for cell clicks
         
@@ -813,6 +945,23 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab):
         config_panel.add(Box.createVerticalStrut(30))
         
         # Replay section
+        replay_label = JLabel("Replay Settings: ")
+        font = replay_label.getFont()
+        replay_label.setFont(Font(font.getFontName(), Font.BOLD, font.getSize()))
+        replay_label.setAlignmentX(0.0)
+        config_panel.add(replay_label)
+        config_panel.add(Box.createVerticalStrut(10))
+        
+        # Thread count field
+        thread_panel = JPanel()
+        thread_panel.setLayout(BoxLayout(thread_panel, BoxLayout.X_AXIS))
+        thread_panel.setAlignmentX(0.0)
+        thread_panel.add(JLabel("Number of replay threads: "))
+        self.replay_thread_count_field = JTextField(str(self.replay_thread_count), 5)
+        self.replay_thread_count_field.setMaximumSize(Dimension(100, 25))
+        thread_panel.add(self.replay_thread_count_field)
+        thread_panel.add(Box.createHorizontalGlue())
+        config_panel.add(thread_panel)
         config_panel.add(Box.createVerticalStrut(10))
 
         replay_button = JButton("Replay All Requests with JWT Tokens", actionPerformed=self._replay_requests)
@@ -1039,15 +1188,26 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab):
         return replay_panel
     
     def _replay_requests(self, event):
-        """Replay all recorded requests with all JWTs."""
-        # Create a background thread for replay
-        class ReplayThread(Thread):
+        """Replay all recorded requests with all JWTs using a thread pool."""
+        # Create a background thread for replay coordination
+        class ReplayCoordinatorThread(Thread):
             def __init__(self, extender):
                 Thread.__init__(self)
                 self.extender = extender
             
             def run(self):
                 try:
+                    # Get thread count from UI and validate
+                    try:
+                        thread_count = int(self.extender.replay_thread_count_field.getText().strip())
+                        if thread_count < 1:
+                            thread_count = 1
+                        elif thread_count > 50:
+                            thread_count = 50
+                        self.extender.replay_thread_count = thread_count
+                    except:
+                        thread_count = self.extender.replay_thread_count
+                    
                     # Create new data structures for replay results
                     self.extender.replay_matrix = defaultdict(lambda: defaultdict(lambda: defaultdict(int)))
                     self.extender.replay_request_details = defaultdict(lambda: defaultdict(lambda: defaultdict(list)))
@@ -1078,17 +1238,24 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab):
                     
                     # Calculate total requests
                     total_requests = len(unique_requests) * len(jwt_tokens)
-                    current_request = 0
                     
                     # Create progress dialog on EDT
                     dialog_ref = [None]
                     progress_ref = [None]
+                    lock_ref = [None]
                     SwingUtilities.invokeAndWait(lambda: self._create_progress_dialog(dialog_ref, progress_ref, total_requests))
                     dialog = dialog_ref[0]
                     progress = progress_ref[0]
                     
+                    # Create atomic counter for thread-safe progress updates
+                    progress_counter = AtomicInteger(0)
+                    
                     try:
-                        # Replay each request
+                        # Create thread pool
+                        executor = Executors.newFixedThreadPool(thread_count)
+                        
+                        # Create tasks for each (request, user, token) combination
+                        tasks = []
                         for req in unique_requests:
                             try:
                                 analyzed_req = self.extender._helpers.analyzeRequest(req)
@@ -1096,96 +1263,44 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab):
                                 url = analyzed_req.getUrl()
                                 method = headers[0].split(' ')[0] if headers and len(headers)>0 else "GET"
                                 endpoint = "%s %s" % (method, url.getPath() + (("?" + url.getQuery()) if url.getQuery() else ""))
-                            
-                                # Add endpoint to replay_endpoints_order immediately
+                                
+                                # Add endpoint to replay_endpoints_order
                                 if endpoint not in self.extender.replay_endpoints_order:
                                     self.extender.replay_endpoints_order.append(endpoint)
-                            
-                                # For each JWT token
-                                for user, token in jwt_tokens.items():
-                                    current_request += 1
-                                    final_current = current_request
-                                    SwingUtilities.invokeLater(lambda: self._update_progress(progress, final_current, total_requests))
-                                    # Create new request with replaced JWT
-                                    new_headers = []
-                                    if self.extender.jwt_location_auth.isSelected():
-                                        # Replace Authorization header
-                                        auth_found = False
-                                        for header in headers:
-                                            if header.lower().startswith("authorization:"):
-                                                new_headers.append("Authorization: Bearer %s" % token)
-                                                auth_found = True
-                                            else:
-                                                new_headers.append(header)
-                                        if not auth_found:
-                                            new_headers.append("Authorization: Bearer %s" % token)
-                                    else:
-                                        # Replace Cookie
-                                        cookie_name = self.extender.cookie_name_field.getText().strip() or "jwt"
-                                        cookie_found = False
-                                        for header in headers:
-                                            if header.lower().startswith("cookie:"):
-                                                cookies = header.split(":",1)[1].strip().split(";")
-                                                new_cookies = []
-                                                for cookie in cookies:
-                                                    if "=" in cookie:
-                                                        name, value = cookie.split("=", 1)
-                                                        if name.strip() == cookie_name:
-                                                            new_cookies.append("%s=%s" % (name.strip(), token))
-                                                            cookie_found = True
-                                                        else:
-                                                            new_cookies.append(cookie)
-                                                new_headers.append("Cookie: %s" % "; ".join(new_cookies))
-                                            else:
-                                                new_headers.append(header)
-                                        if not cookie_found:
-                                            new_headers.append("Cookie: %s=%s" % (cookie_name, token))
-
-                                    # Build new request
-                                    body = req.getRequest()[analyzed_req.getBodyOffset():]
-                                    new_request = self.extender._helpers.buildHttpMessage(new_headers, body)
-
-                                    # Make request
-                                    response = self.extender._callbacks.makeHttpRequest(
-                                        req.getHttpService(),
-                                        new_request
-                                    )
-
-
-                                    # Skip if makeHttpRequest returned None or no response bytes
-                                    if response is None:
-                                        print("No response received for request to %s with user %s" % (endpoint, user))
-                                        continue
-                                    resp_bytes = None
-                                    try:
-                                        resp_bytes = response.getResponse()
-                                    except:
-                                        resp_bytes = None
-                                    if resp_bytes is None:
-                                        print("No response bytes for request to %s with user %s" % (endpoint, user))
-                                        continue
-
-                                    # Process response
-                                    analyzed_resp = self.extender._helpers.analyzeResponse(response.getResponse())
-                                    response_code = str(analyzed_resp.getStatusCode())
-
-                                    # Update replay matrix
-                                    self.extender.replay_matrix[endpoint][user][response_code] += 1
-                                    self.extender.replay_request_details[endpoint][user][response_code].append(response)
                                 
+                                # Create task for each user/token combination
+                                for user, token in jwt_tokens.items():
+                                    task = ReplayTaskCallable(
+                                        self.extender,
+                                        req,
+                                        endpoint,
+                                        user,
+                                        token,
+                                        headers,
+                                        analyzed_req,
+                                        progress,
+                                        progress_counter,
+                                        total_requests
+                                    )
+                                    tasks.append(executor.submit(task))
+                            
                             except Exception as e:
-                                print("Error replaying request to %s with user %s: %s" % (endpoint, user, str(e)))
-        
+                                print("Error preparing replay task: %s" % str(e))
+                        
+                        # Wait for all tasks to complete
+                        executor.shutdown()
+                        executor.awaitTermination(300, TimeUnit.SECONDS)  # Wait up to 5 minutes
+                        
                     finally:
                         # Close progress dialog on EDT
                         SwingUtilities.invokeLater(lambda: dialog.dispose())
-        
+                    
                     # Update replay matrix tab and switch to it
                     SwingUtilities.invokeLater(lambda: self.extender._update_replay_table_model())
                     SwingUtilities.invokeLater(lambda: self.extender.tabbed_pane.setSelectedIndex(2))
-        
-                    print("Replay completed")
-        
+                    
+                    print("Replay completed with %d threads" % thread_count)
+                
                 except Exception as e:
                     print("Error during replay: %s" % str(e))
 
@@ -1205,11 +1320,18 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab):
                 dialog_ref[0] = dialog
                 progress_ref[0] = progress
 
-            def _update_progress(self, progress, current, total):
+            def _update_progress(self, progress, counter, total):
                 """Update progress bar (called on EDT)"""
+                current = counter.get()
                 progress.setValue(current)
                 progress.setString(str(current) + '/' + str(total) + ' (' + str(int((current*100)/total)) + '%)')
-        ReplayThread(self).start()
+        
+        ReplayCoordinatorThread(self).start()
+
+    def _update_replay_progress(self, progress, current, total):
+        """Update progress bar (called on EDT)"""
+        progress.setValue(current)
+        progress.setString(str(current) + '/' + str(total) + ' (' + str(int((current*100)/total)) + '%)')
 
     def _update_table_model(self):
         # prepare ordered lists to preserve stable columns/rows
