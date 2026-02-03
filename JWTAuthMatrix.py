@@ -67,33 +67,42 @@ class ColorCellRenderer(DefaultTableCellRenderer):
                 # Parse the value to determine color
                 # value format: "200: 5, 403: 2" or "0" if no requests
                 if value == "0" or value == "" or value == "No requests":
-                    c.setBackground(self.extender.color_no_requests)
+                    c.setBackground(self.extender.color_no_requests_group[0])
                 else:
-                    # Check for success codes (2xx)
-                    has_success = False
-                    has_client_error = False
-                    has_server_error = False
-                    
+                    # Extract all codes present in this cell
+                    codes = []
                     parts = str(value).split(',')
                     for part in parts:
                         if ':' in part:
                             code = part.split(':')[0].strip()
-                            if code.startswith('2'):
-                                has_success = True
-                            elif code.startswith('4'):
-                                has_client_error = True
-                            elif code.startswith('5'):
-                                has_server_error = True
+                            codes.append(code)
                     
-                    # Color priority: server error > client error > success
-                    if has_server_error:
-                        c.setBackground(self.extender.color_server_error)
-                    elif has_client_error and not has_success:
-                        c.setBackground(self.extender.color_client_error)
-                    elif has_client_error and has_success:
-                        c.setBackground(self.extender.color_mixed)
+                    # Find the best matching group (prioritize more specific patterns)
+                    best_match = None
+                    best_specificity = -1
+                    last_matched_group = None  # Fallback to last matching group
+                    
+                    for group_pattern, (color, label) in self.extender.code_color_groups.items():
+                        # Check if codes match this group pattern (all codes must match)
+                        if self.extender._matches_code_group_pattern(codes, group_pattern):
+                            # More specific patterns (with commas) get higher priority
+                            specificity = group_pattern.count(',')
+                            if specificity > best_specificity:
+                                best_specificity = specificity
+                                best_match = group_pattern
+                            # Track the last matched group as fallback
+                            last_matched_group = group_pattern
+                        # Also track if ANY code matches this group (for fallback)
+                        elif any(self.extender._matches_code_pattern(code, group_pattern) for code in codes):
+                            last_matched_group = group_pattern
+                    
+                    if best_match:
+                        c.setBackground(self.extender.code_color_groups[best_match][0])
+                    elif last_matched_group:
+                        # Fallback: use the last matched group's color
+                        c.setBackground(self.extender.code_color_groups[last_matched_group][0])
                     else:
-                        c.setBackground(self.extender.color_success)
+                        c.setBackground(Color.WHITE)
 
         except:
             c.setBackground(Color.WHITE)
@@ -460,11 +469,22 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab):
         self.listen_intruder = True
         
         # color scheme for response codes (customizable)
-        self.color_success = Color(0x38, 0x77, 0x23)      # green - 2xx only
-        self.color_mixed = Color(0x87, 0xce, 0xeb)        # light blue - mixed 2xx+4xx
-        self.color_client_error = Color(0xff, 0xff, 0x66) # yellow - 4xx only
-        self.color_server_error = Color(0xff, 0x8c, 0x00) # orange - 5xx present
-        self.color_no_requests = Color(0xf3, 0x2a, 0x4c)  # red - no requests
+        # Keep legacy color references for backward compatibility
+        self.color_success = Color(0x38, 0x77, 0x23)      # green
+        self.color_mixed = Color(0x87, 0xce, 0xeb)        # light blue
+        self.color_client_error = Color(0xff, 0xff, 0x66) # yellow
+        self.color_server_error = Color(0xff, 0x8c, 0x00) # orange
+        self.color_no_requests = Color(0xf3, 0x2a, 0x4c)  # red
+        
+        # code-to-color mappings: code_pattern -> (color, label)
+        # Patterns can be individual codes (200) or ranges (2xx, 4xx)
+        self.code_color_groups = OrderedDict([
+            ('2xx', (Color(0x38, 0x77, 0x23), 'Success (2xx)')),
+            ('3xx', (Color(0x87, 0xce, 0xeb), 'Redirect (3xx)')),
+            ('4xx', (Color(0xff, 0xff, 0x66), 'Client Error (4xx)')),
+            ('5xx', (Color(0xff, 0x8c, 0x00), 'Server Error (5xx)')),
+        ])
+        self.color_no_requests_group = (Color(0x33, 0x33, 0x33), 'No Requests')
 
         # data: endpoint -> user -> response_code -> count
         self.matrix = defaultdict(lambda: defaultdict(lambda: defaultdict(int)))
@@ -686,16 +706,18 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab):
         font = label.getFont()
         label.setFont(Font(font.getFontName(), Font.BOLD, font.getSize()))
         legend_panel.add(label)
-        legend_panel.add(self._create_color_box(self.color_success, "2xx only", "success"))
-        legend_panel.add(Box.createHorizontalStrut(10))
-        legend_panel.add(self._create_color_box(self.color_mixed, "Mixed 2xx+4xx", "mixed"))
-        legend_panel.add(Box.createHorizontalStrut(10))
-        legend_panel.add(self._create_color_box(self.color_client_error, "4xx only", "client_error"))
-        legend_panel.add(Box.createHorizontalStrut(10))
-        legend_panel.add(self._create_color_box(self.color_server_error, "5xx present", "server_error"))
-        legend_panel.add(Box.createHorizontalStrut(10))
-        legend_panel.add(self._create_color_box(self.color_no_requests, "No requests", "no_requests"))
+        
+        # Add color boxes for each code group
+        for group_pattern, (color, group_label) in self.code_color_groups.items():
+            legend_panel.add(self._create_color_box(color, group_label, group_pattern))
+            legend_panel.add(Box.createHorizontalStrut(10))
+        
+        # Add no requests color box
+        legend_panel.add(self._create_color_box(self.color_no_requests_group[0], self.color_no_requests_group[1], "no_requests"))
         legend_panel.add(Box.createHorizontalGlue())
+        
+        # Store reference for legend rebuilding
+        self.legend_panel_ref = legend_panel
 
         # Bottom panel with stats and legend
         bottom_panel = JPanel(BorderLayout())
@@ -739,6 +761,36 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab):
         panel.add(JLabel(label))
         
         return panel
+
+    def _rebuild_legend(self):
+        """Rebuild the legend panel with current code groups."""
+        try:
+            # Find the legend panel in the bottom_panel (it's in CENTER)
+            # The matrix_panel is in tabbed_pane, and bottom_panel is in SOUTH
+            # We need to find and update the legend_panel component
+            if hasattr(self, 'legend_panel_ref'):
+                # Clear old components
+                self.legend_panel_ref.removeAll()
+                
+                # Rebuild legend
+                label = JLabel("    Color Legend: ")
+                font = label.getFont()
+                label.setFont(Font(font.getFontName(), Font.BOLD, font.getSize()))
+                self.legend_panel_ref.add(label)
+                
+                # Add color boxes for each code group
+                for group_pattern, (color, group_label) in self.code_color_groups.items():
+                    self.legend_panel_ref.add(self._create_color_box(color, group_label, group_pattern))
+                    self.legend_panel_ref.add(Box.createHorizontalStrut(10))
+                
+                # Add no requests color box
+                self.legend_panel_ref.add(self._create_color_box(self.color_no_requests_group[0], self.color_no_requests_group[1], "no_requests"))
+                self.legend_panel_ref.add(Box.createHorizontalGlue())
+                
+                self.legend_panel_ref.revalidate()
+                self.legend_panel_ref.repaint()
+        except Exception as e:
+            print("Error rebuilding legend: %s" % str(e))
 
     def _create_config_tab(self):
         """Create the configuration tab."""
@@ -854,6 +906,26 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab):
         
         config_panel.add(Box.createVerticalStrut(30))
         
+        # Code Groups Configuration
+        groups_label = JLabel("Response Code Groups: ")
+        font = groups_label.getFont()
+        groups_label.setFont(Font(font.getFontName(), Font.BOLD, font.getSize()))
+        groups_label.setAlignmentX(0.0)
+        config_panel.add(groups_label)
+        config_panel.add(Box.createVerticalStrut(5))
+        
+        groups_desc = JLabel("Manage color-coded response code groupings:")
+        groups_desc.setAlignmentX(0.0)
+        config_panel.add(groups_desc)
+        config_panel.add(Box.createVerticalStrut(10))
+        
+        manage_groups_button = JButton("Manage Code Groups", actionPerformed=self._on_manage_code_groups)
+        manage_groups_button.setMaximumSize(Dimension(300, 30))
+        manage_groups_button.setAlignmentX(0.0)
+        config_panel.add(manage_groups_button)
+        
+        config_panel.add(Box.createVerticalStrut(30))
+        
         # Actions section
         actions_label = JLabel("Actions: ")
         font = actions_label.getFont()
@@ -868,7 +940,6 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab):
         config_panel.add(parse_button)
         
         config_panel.add(Box.createVerticalStrut(10))
-        
         clear_button = JButton("Clear Matrix", actionPerformed=self._on_clear_matrix)
         clear_button.setMaximumSize(Dimension(300, 30))
         clear_button.setAlignmentX(0.0)
@@ -1467,6 +1538,124 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab):
         except Exception as e:
             print("Error updating JWT field: %s" % str(e))
 
+    def _on_manage_code_groups(self, event=None):
+        """Open dialog to manage response code groups and their colors."""
+        try:
+            dialog = JDialog(JFrame(), "Manage Response Code Groups", True)
+            dialog.setSize(600, 400)
+            dialog.setLocationRelativeTo(self._panel)
+            dialog.setDefaultCloseOperation(WindowConstants.DISPOSE_ON_CLOSE)
+            
+            # Main panel
+            main_panel = JPanel(BorderLayout())
+            main_panel.add(JLabel("Configure response code groups and their colors (one pattern per line):"), BorderLayout.NORTH)
+            
+            # Text area for editing groups
+            text_area = JTextArea()
+            text_area.setLineWrap(True)
+            text_area.setWrapStyleWord(True)
+            # Build text from current groups
+            lines = []
+            for pattern, (color, label) in self.code_color_groups.items():
+                r = color.getRed()
+                g = color.getGreen()
+                b = color.getBlue()
+                hex_color = "%02x%02x%02x" % (r, g, b)
+                lines.append("%s:0x%s:%s" % (pattern, hex_color, label))
+            text_area.setText("\n".join(lines))
+            
+            scroll = JScrollPane(text_area)
+            main_panel.add(scroll, BorderLayout.CENTER)
+            
+            # Format help
+            help_label = JLabel("Format: pattern:0xHEXCOLOR:label (e.g., 2xx:0x387723:Success)")
+            help_label.setFont(Font(help_label.getFont().getFontName(), Font.ITALIC, 10))
+            help_panel = JPanel(BorderLayout())
+            help_panel.add(help_label, BorderLayout.WEST)
+            main_panel.add(help_panel, BorderLayout.SOUTH)
+            
+            # Button panel
+            button_panel = JPanel()
+            button_panel.setLayout(BoxLayout(button_panel, BoxLayout.X_AXIS))
+            
+            def apply_changes():
+                try:
+                    new_groups = OrderedDict()
+                    for line in text_area.getText().split('\n'):
+                        line = line.strip()
+                        if not line:
+                            continue
+                        parts = line.split(':')
+                        if len(parts) >= 3:
+                            pattern = parts[0].strip()
+                            hex_color = parts[1].strip()
+                            label = ':'.join(parts[2:]).strip()
+                            
+                            # Parse hex color
+                            if hex_color.startswith('0x'):
+                                hex_color = hex_color[2:]
+                            try:
+                                color_int = int(hex_color, 16)
+                                r = (color_int >> 16) & 0xFF
+                                g = (color_int >> 8) & 0xFF
+                                b = color_int & 0xFF
+                                new_groups[pattern] = (Color(r, g, b), label)
+                            except ValueError:
+                                print("Invalid color format: %s" % hex_color)
+                                continue
+                    
+                    if new_groups:
+                        self.code_color_groups = new_groups
+                        # Rebuild the legend to show new groups
+                        self._rebuild_legend()
+                        self.table.repaint()
+                        print("Code groups updated")
+                        dialog.dispose()
+                except Exception as e:
+                    print("Error applying code groups: %s" % str(e))
+            
+            apply_button = JButton("Apply", actionPerformed=lambda e: apply_changes())
+            cancel_button = JButton("Cancel", actionPerformed=lambda e: dialog.dispose())
+            
+            button_panel.add(Box.createHorizontalGlue())
+            button_panel.add(apply_button)
+            button_panel.add(Box.createHorizontalStrut(10))
+            button_panel.add(cancel_button)
+            
+            main_panel.add(button_panel, BorderLayout.PAGE_END)
+            
+            dialog.setContentPane(main_panel)
+            dialog.setVisible(True)
+        except Exception as e:
+            print("Error opening manage code groups dialog: %s" % str(e))
+
+    def _matches_code_pattern(self, code, pattern):
+        """Check if a response code matches a pattern (e.g., 200 matches 2xx)."""
+        # This method now only checks if a single code matches a single pattern part
+        # For comma-separated patterns, use _matches_code_group_pattern instead
+        if pattern == code:
+            return True
+        # Pattern matching for xx (e.g., 2xx, 4xx)
+        if len(pattern) == 3 and pattern.endswith('xx'):
+            return code.startswith(pattern[0])
+        return False
+    
+    def _matches_code_group_pattern(self, codes, pattern):
+        """Check if a list of codes matches a group pattern (including comma-separated)."""
+        # Handle comma-separated patterns (e.g., "2xx,5xx")
+        if ',' in pattern:
+            # For comma-separated patterns, we need at least one code matching EACH part
+            parts = [p.strip() for p in pattern.split(',')]
+            for part in parts:
+                # Check if at least one code matches this part
+                if not any(self._matches_code_pattern(code, part) for code in codes):
+                    return False
+            # All parts have at least one matching code
+            return True
+        else:
+            # For single patterns, all codes must match
+            return all(self._matches_code_pattern(code, pattern) for code in codes)
+
     def _on_color_change(self, color_type):
         """Open color picker to change a color scheme."""
         try:
@@ -1474,43 +1663,30 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab):
             current_color = None
             title = ""
             
-            if color_type == "success":
-                current_color = self.color_success
-                title = "Choose color for 2xx responses"
-            elif color_type == "mixed":
-                current_color = self.color_mixed
-                title = "Choose color for mixed 2xx+4xx responses"
-            elif color_type == "client_error":
-                current_color = self.color_client_error
-                title = "Choose color for 4xx responses"
-            elif color_type == "server_error":
-                current_color = self.color_server_error
-                title = "Choose color for 5xx responses"
-            elif color_type == "no_requests":
-                current_color = self.color_no_requests
+            if color_type == "no_requests":
+                current_color = self.color_no_requests_group[0]
                 title = "Choose color for no requests"
+            elif color_type in self.code_color_groups:
+                current_color, label = self.code_color_groups[color_type]
+                title = "Choose color for %s" % label
+            else:
+                return
             
             # Show color chooser
             new_color = JColorChooser.showDialog(self._panel, title, current_color)
             
             if new_color is not None:
                 # Update the color
-                if color_type == "success":
-                    self.color_success = new_color
-                elif color_type == "mixed":
-                    self.color_mixed = new_color
-                elif color_type == "client_error":
-                    self.color_client_error = new_color
-                elif color_type == "server_error":
-                    self.color_server_error = new_color
-                elif color_type == "no_requests":
-                    self.color_no_requests = new_color
+                if color_type == "no_requests":
+                    old_label = self.color_no_requests_group[1]
+                    self.color_no_requests_group = (new_color, old_label)
+                elif color_type in self.code_color_groups:
+                    old_label = self.code_color_groups[color_type][1]
+                    self.code_color_groups[color_type] = (new_color, old_label)
                 
-                # Refresh the table to apply new colors
+                # Refresh the table and legend to apply new colors
+                self._rebuild_legend()
                 self.table.repaint()
-                
-                # Rebuild the legend with new colors
-                self._rebuild_matrix_tab()
                 
                 print("Color updated for %s" % color_type)
         except Exception as e:
