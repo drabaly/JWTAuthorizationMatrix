@@ -1271,6 +1271,8 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab):
             def __init__(self, extender):
                 Thread.__init__(self)
                 self.extender = extender
+                self.cancelled = False
+                self.executor = None
             
             def run(self):
                 try:
@@ -1319,8 +1321,8 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab):
                     # Create progress dialog on EDT
                     dialog_ref = [None]
                     progress_ref = [None]
-                    lock_ref = [None]
-                    SwingUtilities.invokeAndWait(lambda: self._create_progress_dialog(dialog_ref, progress_ref, total_requests))
+                    cancel_button_ref = [None]
+                    SwingUtilities.invokeAndWait(lambda: self._create_progress_dialog(dialog_ref, progress_ref, cancel_button_ref, total_requests))
                     dialog = dialog_ref[0]
                     progress = progress_ref[0]
                     
@@ -1330,13 +1332,28 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab):
                     # Create lock for thread-safe replay matrix updates
                     replay_lock = ReentrantLock()
                     
+                    # Store reference to cancel button listener
+                    coordinator_ref = [self]
+                    
+                    def on_cancel_click(event):
+                        """Handle cancel button click"""
+                        coordinator_ref[0].cancelled = True
+                        if coordinator_ref[0].executor:
+                            coordinator_ref[0].executor.shutdownNow()
+                        dialog.dispose()
+                        print("Replay cancelled by user")
+                    
+                    cancel_button_ref[0].addActionListener(lambda e: on_cancel_click(e))
+                    
                     try:
                         # Create thread pool
-                        executor = Executors.newFixedThreadPool(thread_count)
+                        self.executor = Executors.newFixedThreadPool(thread_count)
                         
                         # Create tasks for each (request, user, token) combination
                         tasks = []
                         for req in unique_requests:
+                            if self.cancelled:
+                                break
                             try:
                                 analyzed_req = self.extender._helpers.analyzeRequest(req)
                                 headers = analyzed_req.getHeaders()
@@ -1350,6 +1367,8 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab):
                                 
                                 # Create task for each user/token combination
                                 for user, token in jwt_tokens.items():
+                                    if self.cancelled:
+                                        break
                                     task = ReplayTaskCallable(
                                         self.extender,
                                         req,
@@ -1363,43 +1382,67 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab):
                                         total_requests,
                                         replay_lock
                                     )
-                                    tasks.append(executor.submit(task))
+                                    tasks.append(self.executor.submit(task))
                             
                             except Exception as e:
                                 print("Error preparing replay task: %s" % str(e))
                         
-                        # Wait for all tasks to complete
-                        executor.shutdown()
-                        executor.awaitTermination(300, TimeUnit.SECONDS)  # Wait up to 5 minutes
+                        # Wait for all tasks to complete or cancellation
+                        self.executor.shutdown()
+                        self.executor.awaitTermination(300, TimeUnit.SECONDS)  # Wait up to 5 minutes
                         
                     finally:
-                        # Close progress dialog on EDT
-                        SwingUtilities.invokeLater(lambda: dialog.dispose())
+                        # Close progress dialog on EDT only if not already disposed
+                        def close_dialog():
+                            try:
+                                dialog.dispose()
+                            except:
+                                pass
+                        SwingUtilities.invokeLater(close_dialog)
                     
-                    # Update replay matrix tab and switch to it
-                    SwingUtilities.invokeLater(lambda: self.extender._update_replay_table_model())
-                    SwingUtilities.invokeLater(lambda: self.extender.tabbed_pane.setSelectedIndex(2))
-                    
-                    print("Replay completed with %d threads" % thread_count)
+                    # Only update replay matrix tab if not cancelled
+                    if not self.cancelled:
+                        # Update replay matrix tab and switch to it
+                        SwingUtilities.invokeLater(lambda: self.extender._update_replay_table_model())
+                        SwingUtilities.invokeLater(lambda: self.extender.tabbed_pane.setSelectedIndex(2))
+                        print("Replay completed with %d threads" % thread_count)
+                    else:
+                        print("Replay was cancelled")
                 
                 except Exception as e:
                     print("Error during replay: %s" % str(e))
 
-            def _create_progress_dialog(self, dialog_ref, progress_ref, total_requests):
-                """Create progress dialog (called on EDT)"""
+            def _create_progress_dialog(self, dialog_ref, progress_ref, cancel_button_ref, total_requests):
+                """Create progress dialog with cancel button (called on EDT)"""
                 dialog = JFrame("Replaying Requests...")
                 dialog.setDefaultCloseOperation(WindowConstants.DO_NOTHING_ON_CLOSE)
 
+                # Create panel for progress bar and button
+                panel = JPanel(BorderLayout())
+                
                 progress = JProgressBar(0, total_requests)
                 progress.setStringPainted(True)
-
-                dialog.add(progress)
-                dialog.setSize(300, 80)
+                panel.add(progress, BorderLayout.CENTER)
+                
+                # Create button panel
+                button_panel = JPanel()
+                button_panel.setLayout(BoxLayout(button_panel, BoxLayout.X_AXIS))
+                button_panel.add(Box.createHorizontalGlue())
+                
+                cancel_button = JButton("Cancel")
+                button_panel.add(cancel_button)
+                button_panel.add(Box.createHorizontalStrut(10))
+                
+                panel.add(button_panel, BorderLayout.SOUTH)
+                
+                dialog.add(panel)
+                dialog.setSize(400, 120)
                 dialog.setLocationRelativeTo(None)
                 dialog.setVisible(True)
 
                 dialog_ref[0] = dialog
                 progress_ref[0] = progress
+                cancel_button_ref[0] = cancel_button
 
             def _update_progress(self, progress, counter, total):
                 """Update progress bar (called on EDT)"""
