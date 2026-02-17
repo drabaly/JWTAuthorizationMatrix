@@ -60,10 +60,11 @@ class ColorCellRenderer(DefaultTableCellRenderer):
     def getTableCellRendererComponent(self, table, value, isSelected, hasFocus, row, col):
         c = DefaultTableCellRenderer.getTableCellRendererComponent(self, table, value, isSelected, hasFocus, row, col)
         try:
-            # if col == 0:
+            if col == 0:
+                c.setBackground(DefaultTableCellRenderer().getBackground())  # keep default background for endpoint column
             #     # Endpoint column (text only)
             #     c.setBackground(Color(0x2b, 0x2b, 0x2b))
-            if col > 0:
+            else:
                 # Parse the value to determine color
                 # value format: "200: 5, 403: 2" or "0" if no requests
                 if value == "0" or value == "" or value == "No requests":
