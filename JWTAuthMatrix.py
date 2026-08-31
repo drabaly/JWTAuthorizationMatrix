@@ -492,6 +492,12 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab):
         self.endpoints_order = []
         self.users_order = []
 
+        # replay data: same shape as above, populated by "Replay All Requests with JWT Tokens"
+        self.replay_matrix = defaultdict(lambda: defaultdict(lambda: defaultdict(int)))
+        self.replay_request_details = defaultdict(lambda: defaultdict(lambda: defaultdict(list)))
+        self.replay_endpoints_order = []
+        self.replay_users_order = []
+
         # --- build UI immediately so _panel exists before Burp asks for it
         self._build_ui()
 
@@ -1178,9 +1184,19 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab):
         # Stats label
         self.replay_stats_label = JLabel("Endpoints: 0    Users: 0")
         
+        # Export buttons
+        export_panel = JPanel()
+        export_panel.setLayout(BoxLayout(export_panel, BoxLayout.X_AXIS))
+        replay_export_csv_button = JButton("Export to CSV", actionPerformed=self._on_export_replay_csv)
+        replay_export_json_button = JButton("Export to JSON", actionPerformed=self._on_export_replay_json)
+        export_panel.add(replay_export_csv_button)
+        export_panel.add(Box.createHorizontalStrut(10))
+        export_panel.add(replay_export_json_button)
+        
         # Bottom panel with stats
         bottom_panel = JPanel(BorderLayout())
         bottom_panel.add(self.replay_stats_label, BorderLayout.WEST)
+        bottom_panel.add(export_panel, BorderLayout.EAST)
         
         replay_panel.add(filter_panel, BorderLayout.NORTH)
         replay_panel.add(scroll, BorderLayout.CENTER)
@@ -1982,6 +1998,95 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab):
                 print("Matrix exported to JSON: %s" % file_path)
         except Exception as e:
             print("Error exporting to JSON: %s" % str(e))
+
+    def _on_export_replay_csv(self, event=None):
+        """Export the replay matrix to CSV format."""
+        try:
+            if not self.replay_endpoints_order:
+                print("Nothing to export: run a replay first.")
+                return
+            # Show file chooser
+            chooser = JFileChooser()
+            chooser.setDialogTitle("Save Replay Matrix as CSV")
+            chooser.setFileFilter(FileNameExtensionFilter("CSV files", ["csv"]))
+            result = chooser.showSaveDialog(self._panel)
+            
+            if result == JFileChooser.APPROVE_OPTION:
+                file_path = chooser.getSelectedFile().getAbsolutePath()
+                if not file_path.endswith('.csv'):
+                    file_path += '.csv'
+                
+                # Build CSV content
+                csv_lines = []
+                
+                # Header row
+                header = ["Endpoint"] + list(self.replay_users_order)
+                csv_lines.append(",".join(['"%s"' % h.replace('"', '""') for h in header]))
+                
+                # Data rows
+                for endpoint in self.replay_endpoints_order:
+                    row = ['"%s"' % endpoint.replace('"', '""')]
+                    for user in self.replay_users_order:
+                        code_dict = self.replay_matrix.get(endpoint, {}).get(user, {})
+                        if code_dict:
+                            cell_value = ", ".join(["%s: %d" % (code, count) for code, count in sorted(code_dict.items())])
+                        else:
+                            cell_value = "0"
+                        row.append('"%s"' % cell_value.replace('"', '""'))
+                    csv_lines.append(",".join(row))
+                
+                # Write to file
+                with open(file_path, 'w') as f:
+                    f.write("\n".join(csv_lines))
+                
+                print("Replay matrix exported to CSV: %s" % file_path)
+        except Exception as e:
+            print("Error exporting replay matrix to CSV: %s" % str(e))
+
+    def _on_export_replay_json(self, event=None):
+        """Export the replay matrix to JSON format."""
+        try:
+            if not self.replay_endpoints_order:
+                print("Nothing to export: run a replay first.")
+                return
+            # Show file chooser
+            chooser = JFileChooser()
+            chooser.setDialogTitle("Save Replay Matrix as JSON")
+            chooser.setFileFilter(FileNameExtensionFilter("JSON files", ["json"]))
+            result = chooser.showSaveDialog(self._panel)
+            
+            if result == JFileChooser.APPROVE_OPTION:
+                file_path = chooser.getSelectedFile().getAbsolutePath()
+                if not file_path.endswith('.json'):
+                    file_path += '.json'
+                
+                # Build JSON structure
+                export_data = {
+                    "jwt_field": self.jwt_user_field,
+                    "users": list(self.replay_users_order),
+                    "endpoints": []
+                }
+                
+                for endpoint in self.replay_endpoints_order:
+                    endpoint_data = {
+                        "endpoint": endpoint,
+                        "users": {}
+                    }
+                    for user in self.replay_users_order:
+                        code_dict = self.replay_matrix.get(endpoint, {}).get(user, {})
+                        if code_dict:
+                            endpoint_data["users"][user] = dict(code_dict)
+                        else:
+                            endpoint_data["users"][user] = {}
+                    export_data["endpoints"].append(endpoint_data)
+                
+                # Write to file
+                with open(file_path, 'w') as f:
+                    json.dump(export_data, f, indent=2)
+                
+                print("Replay matrix exported to JSON: %s" % file_path)
+        except Exception as e:
+            print("Error exporting replay matrix to JSON: %s" % str(e))
 
     def _on_add_jwt_row(self, event):
         """Add a new empty row to the JWT table."""
