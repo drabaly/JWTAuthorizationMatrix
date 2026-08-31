@@ -62,8 +62,6 @@ class ColorCellRenderer(DefaultTableCellRenderer):
         try:
             if col == 0:
                 c.setBackground(DefaultTableCellRenderer().getBackground())  # keep default background for endpoint column
-            #     # Endpoint column (text only)
-            #     c.setBackground(Color(0x2b, 0x2b, 0x2b))
             else:
                 # Parse the value to determine color
                 # value format: "200: 5, 403: 2" or "0" if no requests
@@ -935,6 +933,21 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab):
         config_panel.add(actions_label)
         config_panel.add(Box.createVerticalStrut(10))
         
+        # URL filter (regex) for parsing proxy history
+        url_filter_panel = JPanel()
+        url_filter_panel.setLayout(BoxLayout(url_filter_panel, BoxLayout.X_AXIS))
+        url_filter_panel.setAlignmentX(0.0)
+        url_filter_panel.add(JLabel("URL filter (regex, optional): "))
+        self.history_url_filter_field = JTextField("", 25)
+        self.history_url_filter_field.setMaximumSize(Dimension(250, 25))
+        self.history_url_filter_field.setToolTipText(
+            "Only proxy history requests whose full URL matches this regular "
+            "expression will be included when building the matrix. Leave blank to include all requests.")
+        url_filter_panel.add(self.history_url_filter_field)
+        url_filter_panel.add(Box.createHorizontalGlue())
+        config_panel.add(url_filter_panel)
+        config_panel.add(Box.createVerticalStrut(10))
+        
         parse_button = JButton("Parse Proxy History and Build Matrix", actionPerformed=self._on_parse_proxy_history)
         parse_button.setMaximumSize(Dimension(500, 30))
         parse_button.setAlignmentX(0.0)
@@ -1074,96 +1087,6 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab):
         scroll = JScrollPane(config_panel)
         scroll.setBorder(None)
         return scroll
-
-    def _on_clear_matrix(self, event=None):
-        # reset data structures
-        self.matrix = defaultdict(lambda: defaultdict(lambda: defaultdict(int)))
-        self.request_details = defaultdict(lambda: defaultdict(lambda: defaultdict(list)))
-        self.endpoints_order = []
-        self.users_order = []
-        SwingUtilities.invokeLater(lambda: self._update_table_model())
-
-    def _on_parse_proxy_history(self, event=None):
-        # Update listening preferences from checkboxes
-        self._update_listening_preferences()
-        
-        # get configured field
-        try:
-            chosen = self.field_combo.getEditor().getItem().strip()
-            if chosen:
-                self.jwt_user_field = chosen
-        except:
-            pass
-        # fetch proxy history and process each request
-        try:
-            history = self._callbacks.getProxyHistory()
-            # reset matrix first
-            self.matrix = defaultdict(lambda: defaultdict(lambda: defaultdict(int)))
-            self.request_details = defaultdict(lambda: defaultdict(lambda: defaultdict(list)))
-            self.endpoints_order = []
-            self.users_order = []
-            for item in history:
-                try:
-                    # Get request info
-                    analyzed_req = self._helpers.analyzeRequest(item)
-                    headers = analyzed_req.getHeaders()
-                    url = analyzed_req.getUrl()
-                    method = headers[0].split(' ')[0] if headers and len(headers)>0 else "GET"
-                    endpoint = "%s %s" % (method, url.getPath() + (("?" + url.getQuery()) if url.getQuery() else ""))
-                    
-                    # Get response code
-                    response = item.getResponse()
-                    if response is None:
-                        continue
-                    analyzed_resp = self._helpers.analyzeResponse(response)
-                    response_code = str(analyzed_resp.getStatusCode())
-                    
-                    # Find JWT token based on configured location
-                    token = None
-                    if self.jwt_location_auth.isSelected():
-                        # Look in Authorization header
-                        for h in headers:
-                            if h.lower().startswith("authorization:"):
-                                parts = h.split(":",1)[1].strip().split()
-                                if len(parts) >= 2 and parts[0].lower() == "bearer":
-                                    token = parts[1].strip()
-                                    break
-                    else:
-                        # Look in Cookies
-                        cookie_name = self.cookie_name_field.getText().strip() or "jwt"
-                        for h in headers:
-                            if h.lower().startswith("cookie:"):
-                                cookies = h.split(":",1)[1].strip().split(";")
-                                for cookie in cookies:
-                                    if "=" in cookie:
-                                        name, value = cookie.split("=", 1)
-                                        if name.strip() == cookie_name:
-                                            token = value.strip()
-                                            break
-                                if token:
-                                    break
-                
-                    if not token:
-                        continue
-
-                    user = self._parse_jwt_get_field(token, self.jwt_user_field)
-                    if user is None:
-                        user = "<no-%s>" % self.jwt_user_field
-                    if endpoint not in self.endpoints_order:
-                        self.endpoints_order.append(endpoint)
-                    if user not in self.users_order:
-                        self.users_order.append(user)
-                    self.matrix[endpoint][user][response_code] += 1
-                    
-                    # Store the IHttpRequestResponse object
-                    self.request_details[endpoint][user][response_code].append(item)
-                except Exception:
-                    # skip single items on error
-                    continue
-            # finally update UI
-            SwingUtilities.invokeLater(lambda: self._update_table_model())
-        except Exception as e:
-            print("Error parsing proxy history: %s" % str(e))
 
     def _create_replay_matrix_tab(self):
         """Create a tab for displaying replay results."""
@@ -1900,6 +1823,15 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab):
             self.request_details = defaultdict(lambda: defaultdict(lambda: defaultdict(list)))
             self.endpoints_order = []
             self.users_order = []
+            # Compile optional URL regex filter
+            url_filter_pattern = None
+            try:
+                url_filter_text = self.history_url_filter_field.getText().strip()
+                if url_filter_text:
+                    url_filter_pattern = re.compile(url_filter_text)
+            except Exception as filter_err:
+                print("Invalid URL filter regex, ignoring filter: %s" % str(filter_err))
+                url_filter_pattern = None
             for item in history:
                 try:
                     # Get request info
@@ -1908,6 +1840,11 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab):
                     url = analyzed_req.getUrl()
                     method = headers[0].split(' ')[0] if headers and len(headers)>0 else "GET"
                     endpoint = "%s %s" % (method, url.getPath() + (("?" + url.getQuery()) if url.getQuery() else ""))
+                    
+                    # Skip requests that don't match the configured URL filter
+                    if url_filter_pattern is not None:
+                        if not url_filter_pattern.search(str(url)):
+                            continue
                     
                     # Get response code
                     response = item.getResponse()
