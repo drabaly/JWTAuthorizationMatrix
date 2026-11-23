@@ -298,6 +298,31 @@ class MatrixStore(object):
             self._cells = dict((key, entries) for key, entries in self._cells.items()
                                if key[0] in self._endpoints)
 
+    def remove_duplicates(self, identity):
+        """Within each (endpoint, user) cell keep only the first message per identity(message).
+
+        Identities are computed outside the lock (they may read Burp's temp files) so capture
+        is never blocked; messages added meanwhile are kept. Returns the number removed.
+        """
+        with self._lock:
+            cells = [list(entries) for entries in self._cells.values()]
+        doomed = set()
+        for entries in cells:
+            seen = set()
+            for _, msg in entries:
+                key = identity(msg)
+                if key in seen:
+                    doomed.add(id(msg))
+                seen.add(key)
+        with self._lock:
+            for key, entries in self._cells.items():
+                self._cells[key] = [entry for entry in entries if id(entry[1]) not in doomed]
+            self._counts = {}
+            for (endpoint, user), entries in self._cells.items():
+                cell = self._counts.setdefault(endpoint, {}).setdefault(user, Counter())
+                cell.update(code for code, _ in entries)
+        return len(doomed)
+
     def snapshot(self):
         """Return (endpoints, users, counts) where counts[endpoint][user][code] = n."""
         with self._lock:
@@ -957,17 +982,41 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IContextMenuFactory,
                                     url_filter, on_done)
 
     def _capture_in_background(self, load_items, description, url_filter=None, on_done=None):
-        def run():
+        def work():
             added = total = 0
+            for item in load_items():
+                total += 1
+                try:
+                    added += self._capture(item, url_filter=url_filter)
+                except Exception as e:
+                    log("Skipping message: %s" % e)
+            log("Added %d of %d %s (others had no JWT, no response or no URL match)."
+                % (added, total, description))
+
+        self._update_matrix_in_background(work, on_done)
+
+    def remove_duplicates(self, on_done=None):
+        """Per user, drop repeated requests with the same method, URL and body."""
+        def work():
+            removed = self.captured.remove_duplicates(self._request_identity)
+            log("Removed %d duplicate requests." % removed)
+
+        self._update_matrix_in_background(work, on_done)
+
+    def _request_identity(self, message):
+        try:
+            info = self._helpers.analyzeRequest(message)
+            body = self._helpers.bytesToString(message.getRequest()[info.getBodyOffset():])
+            return info.getMethod(), url_text(info.getUrl()), body
+        except Exception as e:
+            log("Treating unreadable request as unique: %s" % e)
+            return id(message)
+
+    def _update_matrix_in_background(self, work, on_done=None):
+        """Run work() off the Swing thread, then refresh the matrix and call on_done."""
+        def run():
             try:
-                for item in load_items():
-                    total += 1
-                    try:
-                        added += self._capture(item, url_filter=url_filter)
-                    except Exception as e:
-                        log("Skipping message: %s" % e)
-                log("Added %d of %d %s (others had no JWT, no response or no URL match)."
-                    % (added, total, description))
+                work()
             finally:
                 def finish():
                     self.matrix_view.refresh()
@@ -975,7 +1024,7 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IContextMenuFactory,
                         on_done()
                 SwingUtilities.invokeLater(finish)
 
-        worker = threading.Thread(target=run, name="jwt-matrix-capture")
+        worker = threading.Thread(target=run, name="jwt-matrix-worker")
         worker.setDaemon(True)
         worker.start()
 
@@ -989,8 +1038,12 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IContextMenuFactory,
             "history_url_filter", self._history_filter.getText()))
         self._import_button = JButton("Rebuild from Proxy history",
                                       actionPerformed=self._on_import_history)
+        self._dedupe_button = JButton("Remove duplicates", actionPerformed=self._on_remove_duplicates)
+        self._dedupe_button.setToolTipText(
+            "For each user, keep one request per identical method, URL and body")
         self.matrix_view = MatrixView(self, self.captured, "Authorization matrix", [
             JLabel("History URL regex:"), self._history_filter, self._import_button,
+            self._dedupe_button,
             JButton("Clear", actionPerformed=lambda e: self._clear_matrix()),
         ])
         self.replay_view = MatrixView(self, self.replayed, "Replay matrix")
@@ -1119,6 +1172,10 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IContextMenuFactory,
             return
         self._import_button.setEnabled(False)
         self.import_history(url_filter, on_done=lambda: self._import_button.setEnabled(True))
+
+    def _on_remove_duplicates(self, event):
+        self._dedupe_button.setEnabled(False)
+        self.remove_duplicates(on_done=lambda: self._dedupe_button.setEnabled(True))
 
     def _start_replay(self):
         tokens = self.tokens.tokens()

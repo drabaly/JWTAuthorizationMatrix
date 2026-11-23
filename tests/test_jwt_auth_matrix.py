@@ -94,6 +94,9 @@ class FakeHelpers(object):
     def analyzeResponse(self, raw):
         return FakeResponseInfo(raw)
 
+    def bytesToString(self, data):
+        return data
+
     def buildHttpMessage(self, headers, body):
         return "\r\n".join(headers) + "\r\n\r\n" + body
 
@@ -321,6 +324,19 @@ class MatrixStoreTests(unittest.TestCase):
         self.assertEqual(store.all_messages(), ["m2"])
 
 
+class DuplicateTests(unittest.TestCase):
+    def test_store_keeps_first_message_per_identity_within_each_cell(self):
+        store = m.MatrixStore()
+        store.add("GET /a", "alice", "200", "a1")
+        store.add("GET /a", "alice", "500", "a1-again")
+        store.add("GET /a", "bob", "200", "a1")          # other user: kept
+        store.add("GET /a", "alice", "200", "a2")
+        removed = store.remove_duplicates(lambda msg: msg.split("-")[0])
+        self.assertEqual(removed, 1)
+        self.assertEqual(store.messages(["GET /a"], "alice"), ["a1", "a2"])
+        self.assertEqual(store.snapshot()[2], {"GET /a": {"alice": {"200": 2}, "bob": {"200": 1}}})
+
+
 class TokenTableTests(unittest.TestCase):
     def test_upsert_updates_existing_user_and_tokens_skip_blank_rows(self):
         model = m.TokenTableModel()
@@ -396,6 +412,25 @@ class CaptureTests(unittest.TestCase):
         self.capture(message("/0", "Authorization: Bearer " + ALICE))   # rows shift meanwhile
         view.delete_endpoints(doomed)
         self.assertEqual(self.ext.captured.snapshot()[0], ["GET /a", "GET /0"])
+
+    def test_remove_duplicates_per_user_by_method_url_and_body(self):
+        auth = "Authorization: Bearer "
+        for msg in [message("/a?x=1", auth + ALICE), message("/a?x=1", auth + ALICE, status=403),
+                    message("/a?x=2", auth + ALICE),
+                    message("/a?x=1", auth + BOB),
+                    message("/p", auth + ALICE, method="POST", body="id=1"),
+                    message("/p", auth + ALICE, method="POST", body="id=1"),
+                    message("/p", auth + ALICE, method="POST", body="id=2")]:
+            self.capture(msg)
+        done = threading.Event()
+        self.ext.remove_duplicates(on_done=done.set)
+        self.assertTrue(done.wait(10))
+        self.assertEqual(self.ext.captured.snapshot()[2], {
+            "GET /a?x=1": {"alice": {"200": 1}, "bob": {"200": 1}},
+            "GET /a?x=2": {"alice": {"200": 1}},
+            "POST /p": {"alice": {"200": 2}},
+        })
+        self.assertEqual(cell(self.ext.matrix_view, 0, 1), "200: 2")   # view refreshed
 
     def test_send_to_matrix_skips_bad_messages(self):
         class Broken(FakeMessage):
