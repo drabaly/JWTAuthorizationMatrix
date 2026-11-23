@@ -36,6 +36,7 @@ LOCATION_AUTH = "auth"
 LOCATION_COOKIE = "cookie"
 DEFAULT_COOKIE_NAME = "jwt"
 MAX_REPLAY_THREADS = 50
+ANONYMOUS_USER = "<anonymous>"   # replay user whose requests carry no token
 
 # (status pattern, RGB colour, legend label). A pattern is a code ("401"), a class ("4xx"),
 # or a comma-separated combination ("2xx,5xx") that matches cells containing every part.
@@ -120,23 +121,35 @@ def extract_token(headers, location, cookie_name):
 
 
 def replace_token(headers, token, location, cookie_name):
-    """Return a copy of the request headers carrying `token` in the configured location."""
+    """Return a copy of the request headers carrying `token` in the configured location.
+
+    token=None strips the token instead, to replay the request unauthenticated.
+    """
     result, replaced, cookie_index = [], False, None
     for header in headers:
         name, value = _split_header(header)
         if location == LOCATION_AUTH and name == "authorization":
-            header, replaced = "Authorization: Bearer %s" % token, True
+            replaced = True
+            if token is None:
+                continue
+            header = "Authorization: Bearer %s" % token
         elif location == LOCATION_COOKIE and name == "cookie":
             pairs = _parse_cookies(value)
-            for pair in pairs:
-                if pair[0] == cookie_name:
-                    pair[1], replaced = token, True
+            replaced = replaced or any(pair[0] == cookie_name for pair in pairs)
+            if token is None:
+                pairs = [pair for pair in pairs if pair[0] != cookie_name]
+                if not pairs:
+                    continue
+            else:
+                for pair in pairs:
+                    if pair[0] == cookie_name:
+                        pair[1] = token
             header = "Cookie: " + _format_cookies(pairs)
             if cookie_index is None:
                 cookie_index = len(result)
         result.append(header)
 
-    if not replaced:
+    if not replaced and token is not None:
         if location == LOCATION_AUTH:
             result.append("Authorization: Bearer %s" % token)
         elif cookie_index is not None:
@@ -503,13 +516,20 @@ class TokenTableModel(DefaultTableModel):
                 return
         self.addRow([user, token, seen])
 
+    def add_anonymous(self):
+        if ANONYMOUS_USER not in [self.getValueAt(row, 0) for row in range(self.getRowCount())]:
+            self.addRow([ANONYMOUS_USER, "", "(replayed without a token)"])
+
     def tokens(self):
+        """User -> token for replay; the anonymous user maps to None (send no token)."""
         tokens = OrderedDict()
         for row in range(self.getRowCount()):
             user = (self.getValueAt(row, 0) or "").strip()
             token = (self.getValueAt(row, 1) or "").strip()
             if user and token:
                 tokens[user] = token
+            elif user == ANONYMOUS_USER:
+                tokens[user] = None
         return tokens
 
 
@@ -1009,6 +1029,8 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IContextMenuFactory,
 
         buttons = JPanel(FlowLayout(FlowLayout.LEFT, 6, 0))
         buttons.add(JButton("Add row", actionPerformed=lambda e: self.tokens.addRow(["", "", ""])))
+        buttons.add(JButton("Add anonymous user",
+                            actionPerformed=lambda e: self.tokens.add_anonymous()))
         buttons.add(JButton("Delete selected", actionPerformed=delete_selected))
         buttons.add(Box.createHorizontalStrut(20))
         buttons.add(JLabel("Threads:"))

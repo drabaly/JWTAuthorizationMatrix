@@ -109,6 +109,7 @@ class FakeCallbacks(object):
         self.persisted = []     # messages passed to saveBuffersToTempFiles
         self.status_for_token = {}
         self.delay = 0          # seconds makeHttpRequest blocks, to expose queueing bugs
+        self.anonymous_status = None   # status for requests carrying no known token
 
     def getHelpers(self):
         return self.helpers
@@ -147,6 +148,8 @@ class FakeCallbacks(object):
         for token, status in self.status_for_token.items():
             if token in raw:
                 return FakeMessage(raw, "HTTP/1.1 %d X\r\n\r\n" % status)
+        if self.anonymous_status and "Authorization:" not in raw:
+            return FakeMessage(raw, "HTTP/1.1 %d X\r\n\r\n" % self.anonymous_status)
         return FakeMessage(raw, None)
 
 
@@ -211,6 +214,19 @@ class TokenTests(unittest.TestCase):
         headers = ["GET / HTTP/1.1", "Cookie: a=1"]
         self.assertEqual(m.replace_token(headers, "new", m.LOCATION_COOKIE, "jwt"),
                          ["GET / HTTP/1.1", "Cookie: a=1; jwt=new"])
+
+    def test_no_token_removes_authorization_header(self):
+        headers = ["GET / HTTP/1.1", "Authorization: Bearer old", "X: y"]
+        self.assertEqual(m.replace_token(headers, None, m.LOCATION_AUTH, "jwt"),
+                         ["GET / HTTP/1.1", "X: y"])
+
+    def test_no_token_removes_cookie_and_empty_cookie_header(self):
+        self.assertEqual(m.replace_token(["GET / HTTP/1.1", "Cookie: a=1; jwt=old"], None,
+                                         m.LOCATION_COOKIE, "jwt"),
+                         ["GET / HTTP/1.1", "Cookie: a=1"])
+        self.assertEqual(m.replace_token(["GET / HTTP/1.1", "Cookie: jwt=old"], None,
+                                         m.LOCATION_COOKIE, "jwt"),
+                         ["GET / HTTP/1.1"])
 
     def test_replace_cookie_adds_cookie_header_when_absent(self):
         self.assertEqual(m.replace_token(["GET / HTTP/1.1"], "new", m.LOCATION_COOKIE, "jwt"),
@@ -315,6 +331,14 @@ class TokenTableTests(unittest.TestCase):
         self.assertEqual(model.getRowCount(), 3)
         self.assertEqual(list(model.tokens().items()), [("alice", "t3"), ("bob", "t2")])
         self.assertFalse(model.isCellEditable(0, 2))
+
+    def test_anonymous_row_is_added_once_and_replays_without_token(self):
+        model = m.TokenTableModel()
+        model.upsert("alice", "t1", "now")
+        model.add_anonymous()
+        model.add_anonymous()
+        self.assertEqual(model.getRowCount(), 2)
+        self.assertEqual(list(model.tokens().items()), [("alice", "t1"), (m.ANONYMOUS_USER, None)])
 
 
 # --------------------------------------------------------------------------- extension
@@ -423,6 +447,20 @@ class ReplayTests(unittest.TestCase):
         self.assertTrue(any(raw.endswith("\r\n\r\npayload") and BOB in raw for raw in callbacks.sent))
         self.assertEqual(max(progress), (6, 6))
 
+
+    def test_anonymous_user_replays_without_authorization(self):
+        callbacks = FakeCallbacks()
+        callbacks.anonymous_status = 401
+        store = m.MatrixStore()
+        finished = threading.Event()
+        job = m.ReplayJob(callbacks, store, [message("/a", "Authorization: Bearer " + ALICE)],
+                          m.OrderedDict([(m.ANONYMOUS_USER, None)]), m.LOCATION_AUTH, "jwt", 1,
+                          on_progress=lambda done, total: None,
+                          on_finished=lambda cancelled: finished.set())
+        job.start()
+        self.assertTrue(finished.wait(10))
+        self.assertEqual(store.snapshot()[2], {"GET /a": {m.ANONYMOUS_USER: {"401": 1}}})
+        self.assertNotIn("Authorization:", callbacks.sent[0])
 
     def test_cancel_stops_pending_requests(self):
         callbacks = FakeCallbacks()

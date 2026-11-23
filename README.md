@@ -52,7 +52,8 @@ in Burp → **Send to JWT Authorization Matrix**.
 ### Replay
 
 The token table fills automatically with the latest JWT seen for each user; you can add,
-edit or delete rows. Set the thread count (1–50) and click
+edit or delete rows. **Add anonymous user** adds an `<anonymous>` row whose requests are
+replayed with the JWT removed, to spot endpoints that need no authentication. Set the thread count (1–50) and click
 **Replay all captured requests with these tokens**. Results appear in the replay matrix
 below the table as they arrive. The replay can be cancelled at any time.
 
