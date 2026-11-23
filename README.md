@@ -46,6 +46,8 @@ in Burp → **Send to JWT Authorization Matrix**.
 
 - Click a status cell to open the matching requests/responses.
 - Click an endpoint with `[+]` to show its query-string variants.
+- Click a column header to sort (ascending ▲, descending ▼, then capture order). Variants
+  stay under their endpoint; user columns sort by status codes, then counts.
 - Select rows and right-click to delete endpoints.
 - **Remove duplicates** keeps, for each user, one request per identical method + URL
   (query string included) + body. This also shortens the replay.

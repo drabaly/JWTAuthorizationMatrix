@@ -571,12 +571,15 @@ class MatrixTableModel(AbstractTableModel):
         self._expanded = set()
         self._rows = []   # (kind, label endpoint, endpoints aggregated by the row)
         self._row_codes = []   # per row, per user: {code: count}
+        self._sort = None      # (model column, ascending) or None for capture order
 
     def load(self, endpoints, users, counts):
         structure_changed = users != self._users
         self._users, self._counts = users, counts
         self._groups = group_endpoints(endpoints)
         self._expanded &= set(self._groups)
+        if self._sort and self._sort[0] > len(users):
+            self._sort = None
         self._rebuild_rows()
         if structure_changed:
             self.fireTableStructureChanged()
@@ -586,12 +589,27 @@ class MatrixTableModel(AbstractTableModel):
     def _expandable(self, base):
         return self._groups[base] != [base]
 
+    def _sorted(self, items, key):
+        """Order (label, endpoints) items by the sort column; capture order when unsorted."""
+        if not self._sort:
+            return items
+        col, ascending = self._sort
+        if col == 0:
+            sort_key = lambda item: key(item)[0].lower()
+        else:
+            user = self.user_at(col)
+            sort_key = lambda item: sorted(self._aggregate(key(item)[1], user).items())
+        return sorted(items, key=sort_key, reverse=not ascending)
+
     def _rebuild_rows(self):
+        # Endpoints are sorted among themselves and variants only within their endpoint,
+        # so expanded variants always stay directly under the row they belong to.
         rows = []
-        for base, variants in self._groups.items():
+        for base, variants in self._sorted(self._groups.items(), lambda g: g):
             rows.append((self.BASE, base, variants))
             if base in self._expanded:
-                rows.extend((self.CHILD, variant, [variant]) for variant in variants)
+                for variant in self._sorted(variants, lambda v: (v, [v])):
+                    rows.append((self.CHILD, variant, [variant]))
         self._rows = rows
         self._row_codes = [[self._aggregate(endpoints, user) for user in self._users]
                            for _, _, endpoints in rows]
@@ -611,6 +629,17 @@ class MatrixTableModel(AbstractTableModel):
         self._rebuild_rows()
         self.fireTableDataChanged()
         return True
+
+    def toggle_sort(self, col):
+        """Cycle a column through ascending, descending and capture order."""
+        if not self._sort or self._sort[0] != col:
+            self._sort = (col, True)
+        elif self._sort[1]:
+            self._sort = (col, False)
+        else:
+            self._sort = None
+        self._rebuild_rows()
+        self.fireTableDataChanged()
 
     def row_key(self, row):
         return self._rows[row][:2]
@@ -641,7 +670,10 @@ class MatrixTableModel(AbstractTableModel):
         return Object if col == 0 else String
 
     def getColumnName(self, col):
-        return "Endpoint" if col == 0 else self.user_at(col)
+        name = "Endpoint" if col == 0 else self.user_at(col)
+        if self._sort and self._sort[0] == col:
+            name += u" \u25b2" if self._sort[1] else u" \u25bc"
+        return name
 
     def getValueAt(self, row, col):
         if col > 0:
@@ -655,7 +687,8 @@ class MatrixTableModel(AbstractTableModel):
 
 
 class _FilterOnlySorter(TableRowSorter):
-    """Filtering without sorting: sorting would separate variant rows from their base row."""
+    """Filter only. Sorting is done by MatrixTableModel, which keeps variants under their
+    endpoint; a plain row sorter would scatter them."""
 
     def isSortable(self, column):
         return False
@@ -696,12 +729,13 @@ class _MatrixMouse(MouseAdapter):
         self._view.on_click(event)
 
 
-class _SwatchClick(MouseAdapter):
+class _OnClick(MouseAdapter):
     def __init__(self, callback):
         self._callback = callback
 
     def mouseClicked(self, event):
-        self._callback()
+        if SwingUtilities.isLeftMouseButton(event):
+            self._callback(event)
 
 
 class MatrixView(object):
@@ -723,6 +757,7 @@ class MatrixView(object):
         self.table.getTableHeader().setReorderingAllowed(False)
         self.table.setSelectionMode(ListSelectionModel.MULTIPLE_INTERVAL_SELECTION)
         self.table.addMouseListener(_MatrixMouse(self))
+        self.table.getTableHeader().addMouseListener(_OnClick(self._on_header_click))
 
         self._filter = JTextField()
         on_text_change(self._filter, self._apply_filter)
@@ -769,6 +804,17 @@ class MatrixView(object):
         self._keeping_selection(lambda: self.model.load(endpoints, users, counts))
         self._stats.setText("  Endpoints: %d (base: %d)   Users: %d  " % (
             len(endpoints), self.model.base_count(), len(users)))
+
+    def _on_header_click(self, event):
+        col = self.table.getTableHeader().columnAtPoint(event.getPoint())
+        if col >= 0:
+            self.toggle_sort(self.table.convertColumnIndexToModel(col))
+
+    def toggle_sort(self, model_col):
+        self._keeping_selection(lambda: self.model.toggle_sort(model_col))
+        for column in self.table.getColumnModel().getColumns():
+            column.setHeaderValue(self.model.getColumnName(column.getModelIndex()))
+        self.table.getTableHeader().repaint()
 
     def _apply_filter(self):
         text = self._filter.getText().strip()
@@ -851,7 +897,7 @@ class MatrixView(object):
         swatch.setForeground(readable_text_color(Color(rgb)))
         swatch.setToolTipText("Click to change colour")
         swatch.setCursor(Cursor.getPredefinedCursor(Cursor.HAND_CURSOR))
-        swatch.addMouseListener(_SwatchClick(lambda: self._ext.choose_color(group_index)))
+        swatch.addMouseListener(_OnClick(lambda e: self._ext.choose_color(group_index)))
         return swatch
 
     def _export(self, fmt):

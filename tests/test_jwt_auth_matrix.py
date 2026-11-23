@@ -442,6 +442,40 @@ class CaptureTests(unittest.TestCase):
         self.assertTrue(done.wait(10))
         self.assertEqual(self.ext.captured.snapshot()[0], ["GET /a"])
 
+    def test_header_sort_cycles_and_keeps_variants_under_their_endpoint(self):
+        auth = "Authorization: Bearer "
+        self.capture(message("/b", auth + ALICE, status=403))
+        self.capture(message("/a?x=2", auth + ALICE))
+        self.capture(message("/a?x=1", auth + ALICE, status=500))
+        self.capture(message("/C", auth + ALICE))
+        view, model = self.ext.matrix_view, self.ext.matrix_view.model
+        model.toggle(1)   # expand GET /a
+
+        def labels():
+            return [cell(view, r, 0).strip() for r in range(model.getRowCount())]
+
+        self.assertEqual(labels(), ["GET /b", "[-] GET /a", "GET /a?x=2", "GET /a?x=1", "GET /C"])
+        view.toggle_sort(0)
+        self.assertEqual(labels(), ["[-] GET /a", "GET /a?x=1", "GET /a?x=2", "GET /b", "GET /C"])
+        self.assertEqual(view.table.getColumnModel().getColumn(0).getHeaderValue(),
+                         u"Endpoint \u25b2")
+        view.toggle_sort(0)
+        self.assertEqual(labels(), ["GET /C", "GET /b", "[-] GET /a", "GET /a?x=2", "GET /a?x=1"])
+        view.toggle_sort(1)   # alice: by status codes, then counts
+        self.assertEqual(labels(), ["GET /C", "[-] GET /a", "GET /a?x=2", "GET /a?x=1", "GET /b"])
+        self.assertEqual(view.table.getColumnModel().getColumn(0).getHeaderValue(), "Endpoint")
+        view.toggle_sort(1)
+        view.toggle_sort(1)   # third click: back to capture order
+        self.assertEqual(labels(), ["GET /b", "[-] GET /a", "GET /a?x=2", "GET /a?x=1", "GET /C"])
+        self.assertEqual(view.table.getColumnModel().getColumn(1).getHeaderValue(), "alice")
+
+    def test_sort_survives_live_updates(self):
+        auth = "Authorization: Bearer "
+        self.capture(message("/b", auth + ALICE))
+        self.ext.matrix_view.toggle_sort(0)
+        self.capture(message("/a", auth + ALICE))
+        self.assertEqual(cell(self.ext.matrix_view, 0, 0), "GET /a")
+
     def test_import_proxy_history_rebuilds_matrix_with_url_filter(self):
         self.capture(message("/old", "Authorization: Bearer " + ALICE))
         self.callbacks.history = [message("/api/x", "Authorization: Bearer " + ALICE),
