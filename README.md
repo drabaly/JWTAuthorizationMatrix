@@ -1,95 +1,74 @@
 # JWT Authorization Matrix
 
-A Burp Suite extension for testing JWT (JSON Web Token) based authorization in web applications. This extension creates a matrix view of endpoints vs users, helping pentesters identify authorization issues across different user roles.
+A Burp Suite extension for testing JWT-based authorization. It builds a matrix of
+endpoints × users (identified by a JWT claim) showing the HTTP status codes each user
+received, then replays every captured request with every user's token so access-control
+gaps stand out.
 
 ## Features
 
-- Creates a visual matrix of endpoint access patterns
-- Captures and organizes requests with JWT tokens
-- Supports JWT tokens in both Authorization headers and Cookies
-- Color-coded response status codes for quick analysis
-- Detailed request/response inspection for each matrix cell
-- Replay functionality to test endpoints with different JWT tokens
-- Multithreaded replay for fast endpoint testing (configurable thread count)
-- JWT token management table for tracking valid tokens
-- Proxy history parsing for retrospective analysis
-- Configurable JWT claim field for user identification
-- Request grouping by endpoint patterns
-- Multi-line selection and batch deletion of endpoints
+- Live capture from Proxy, Repeater and Intruder (selectable), or rebuild from Proxy history
+  with an optional URL regex
+- JWT read from the `Authorization: Bearer` header or a named cookie
+- Configurable user claim, including nested claims (`user.email`)
+- Endpoints grouped by method + path; `[+]` expands query-string variants
+- Colour-coded cells with configurable status-code groups (`2xx`, `401`, `2xx,5xx`, ...)
+- Click a cell to inspect its requests and responses in Burp's message viewers
+- Multi-select + right-click to delete endpoints
+- Multithreaded, cancellable replay of all captured requests with each user's token
+- CSV / JSON export of both matrices
+- Settings persist across Burp restarts (tokens are never saved)
 
 ## Installation
 
-1. Download and install [Jython Standalone JAR](https://www.jython.org/download.html)
-2. In Burp Suite, go to `Extender` -> `Options`
-3. Under "Python Environment", set the location of your Jython standalone JAR
-4. Go to `Extender` -> `Extensions`
-5. Click "Add", select "Python" as the extension type
-6. Select the `JWTAuthMatrix.py` file
-7. Click "Next" to load the extension
+1. Download the [Jython standalone JAR](https://www.jython.org/download.html) (2.7.x).
+2. In Burp, `Extensions` → `Extensions settings` → `Python environment`: select the JAR.
+3. `Extensions` → `Installed` → `Add`, type `Python`, select `JWTAuthMatrix.py`.
 
 ## Usage
 
-### Configuration
+The extension adds a **JWT Auth Matrix** tab with three sub-tabs.
 
-1. Go to the "Configuration" tab in the JWT Authorization Matrix
-2. Set the JWT claim field used to identify users (default: "sub")
-3. Choose JWT token location (Authorization header or Cookie)
-4. Configure which Burp tools to monitor (Proxy, Repeater, Intruder)
+### Settings
 
-### Building the Matrix
+- **Capture**: which Burp tools feed the matrix.
+- **Token location**: Authorization header or cookie name. Also used when replaying.
+- **User claim**: JWT claim identifying users (default `sub`). Applies to new captures;
+  use *Rebuild from Proxy history* to regroup existing traffic.
+- **Colours**: edit status-code groups, one per line as `pattern:0xRRGGBB:label`. Click a
+  legend swatch to change a single colour.
 
-The matrix can be populated in two ways:
-1. **Automatic Capture**: Browse the application while the extension is running
-2. **Parse Proxy History**: Click "Parse Proxy History" to analyze existing Burp traffic
+### Matrix
 
-### Matrix Features
+Browse the application as different users, or click **Rebuild from Proxy history**
+(optionally restricted by *History URL regex*). You can also right-click messages anywhere
+in Burp → **Send to JWT Authorization Matrix**.
 
-- Click cells to view detailed requests and responses
-- Use [+] to expand grouped endpoints with parameters
-- **Select multiple rows** using Ctrl+Click or Shift+Click
-- **Right-click on selected rows** to delete multiple endpoints at once
-- Filter endpoints using the search box
+- Click a status cell to open the matching requests/responses.
+- Click an endpoint with `[+]` to show its query-string variants.
+- Select rows and right-click to delete endpoints.
+- Type in *Filter endpoints* to narrow the view.
 
-### JWT Management
+### Replay
 
-- Track valid JWT tokens for different users
-- Replay captured requests with different tokens
-- Test authorization across user roles
-
-### Replay Testing
-
-1. Add JWT tokens to the JWT Management table
-2. Optionally configure the number of replay threads (default: 5, range: 1-50)
-3. Click "Replay All Requests with JWT Tokens"
-4. View results in the Replay Matrix tab
-
-#### Replay Performance
-
-- The replay feature uses multithreading for improved performance
-- Configure thread count in the Configuration tab under "Replay Settings"
-- More threads = faster replay, but may impact system resources
-- Recommended: 5-10 threads for most systems
+The token table fills automatically with the latest JWT seen for each user; you can add,
+edit or delete rows. Set the thread count (1–50) and click
+**Replay all captured requests with these tokens**. Results appear in the replay matrix
+below the table as they arrive. The replay can be cancelled at any time.
 
 ## Development
 
-This extension is written in Python (Jython) and uses Burp's Extender API.
+Single-file Jython 2.7 extension using Burp's legacy Extender API. The tests run the real
+extension under Jython in headless Swing, with fakes for Burp's callbacks:
 
-### Requirements
-
-- Burp Suite Professional
-- Jython Standalone 2.7.x
-- Java Runtime Environment
+```sh
+./tests/run_tests.sh   # override JYTHON_JAR / BURP_JAR if not under /opt/BurpSuitePro
+```
 
 ## License
 
-This project is licensed under the MIT License.
-
-## Contributing
-
-Contributions are welcome! Please feel free to submit pull requests.
+MIT
 
 ## Author
 
 Alexis Pain
-
-(This code is a mess because it's written by Claude AI and debugged by me....)

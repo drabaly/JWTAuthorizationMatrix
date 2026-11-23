@@ -1,2288 +1,1238 @@
-# -*- coding: UTF-8 -*-
-# Burp JWT Authorization Matrix extension (Jython)
-# Save as JwtAuthMatrix.py and load in Burp's Extender using Jython standalone.
-#
-# NOTE: This is written for Burp's Jython environment.
-# Tested conceptually against Burp Extender API patterns (IHttpListener + ITab).
-# Adjust minor API/constant name differences if your Burp edition varies.
+# -*- coding: utf-8 -*-
+"""JWT Authorization Matrix: a Burp Suite extension (Jython 2.7, legacy Extender API).
 
-from burp import IBurpExtender
-from burp import IHttpListener
-from burp import ITab
-from burp import IMessageEditorController
-from burp import IContextMenuFactory
-from java.lang import Object, Thread, Runnable
-from java.util.concurrent import Executors, TimeUnit, Callable
-from java.util.concurrent.atomic import AtomicInteger
-from java.util.concurrent.locks import ReentrantLock
-from java.awt import BorderLayout, Color, Dimension, Font
-from javax.swing import (JPanel, JFrame, JTable, JScrollPane, JLabel, JTextArea,
-                         JButton, JComboBox, Box, BoxLayout, SwingUtilities,
-                         JSplitPane, JTabbedPane, JTextField, RowFilter, JCheckBox, JFileChooser, 
-                         JColorChooser, JDialog, JPopupMenu, JMenuItem, ListSelectionModel, ImageIcon,
-                         JProgressBar, WindowConstants)
-from javax.swing.table import AbstractTableModel, DefaultTableCellRenderer, TableRowSorter, DefaultTableModel
-from javax.swing.event import DocumentListener, ListSelectionListener
-from javax.swing.filechooser import FileNameExtensionFilter
-from java.awt.event import MouseAdapter, MouseEvent
-from javax.swing.tree import DefaultMutableTreeNode
-from javax.swing import ButtonGroup, JRadioButton
-import javax.swing
+Builds an endpoint x user matrix of HTTP status codes from requests that carry a JWT,
+and replays every captured request with each known user's token to expose
+authorization flaws.
+"""
+
 import base64
 import json
-from collections import defaultdict, OrderedDict
 import re
-import java.util.Date
-from java.util import ArrayList
+import threading
+from collections import Counter, OrderedDict
+
+from burp import (IBurpExtender, IContextMenuFactory, IExtensionStateListener,
+                  IHttpListener, IMessageEditorController, ITab)
+from java.awt import BorderLayout, Color, Cursor, Dimension, FlowLayout, Font
+from java.awt.event import MouseAdapter
+from java.lang import Object, String
+from java.util import ArrayList, Date
+from java.util.concurrent import Executors, RejectedExecutionException, TimeUnit
+from java.util.regex import Pattern
+from javax.swing import (BorderFactory, Box, BoxLayout, ButtonGroup, JButton, JCheckBox,
+                         JColorChooser, JComboBox, JFileChooser, JFrame, JLabel, JMenuItem,
+                         JOptionPane, JPanel, JPopupMenu, JProgressBar, JRadioButton,
+                         JScrollPane, JSpinner, JSplitPane, JTabbedPane, JTable, JTextArea,
+                         JTextField, ListSelectionModel, RowFilter, SpinnerNumberModel,
+                         SwingUtilities, WindowConstants)
+from javax.swing.event import DocumentListener
+from javax.swing.filechooser import FileNameExtensionFilter
+from javax.swing.table import (AbstractTableModel, DefaultTableCellRenderer, DefaultTableModel,
+                               TableRowSorter)
+
+EXTENSION_NAME = "JWT Authorization Matrix"
+LOCATION_AUTH = "auth"
+LOCATION_COOKIE = "cookie"
+DEFAULT_COOKIE_NAME = "jwt"
+MAX_REPLAY_THREADS = 50
+
+# (status pattern, RGB colour, legend label). A pattern is a code ("401"), a class ("4xx"),
+# or a comma-separated combination ("2xx,5xx") that matches cells containing every part.
+DEFAULT_CODE_GROUPS = [
+    ("2xx", 0x387723, "Success (2xx)"),
+    ("3xx", 0x87CEEB, "Redirect (3xx)"),
+    ("4xx", 0xFFFF66, "Client Error (4xx)"),
+    ("5xx", 0xFF8C00, "Server Error (5xx)"),
+]
+DEFAULT_NO_REQUESTS_COLOR = 0x333333
 
 
-class FilterListener(DocumentListener):
-    """Listener to filter table rows based on text input."""
-    def __init__(self, extender):
-        self.extender = extender
-    
-    def insertUpdate(self, e):
-        self.extender._apply_filter()
-    
-    def removeUpdate(self, e):
-        self.extender._apply_filter()
-    
-    def changedUpdate(self, e):
-        self.extender._apply_filter()
+def log(message):
+    print("[%s] %s" % (EXTENSION_NAME, message))
 
 
-class ColorCellRenderer(DefaultTableCellRenderer):
-    """Custom cell renderer for coloring based on response codes."""
-    def __init__(self, extender):
-        DefaultTableCellRenderer.__init__(self)
-        self.extender = extender
-    
-    def getTableCellRendererComponent(self, table, value, isSelected, hasFocus, row, col):
-        c = DefaultTableCellRenderer.getTableCellRendererComponent(self, table, value, isSelected, hasFocus, row, col)
+# =============================================================================
+# Pure helpers (no Burp or Swing state)
+# =============================================================================
+
+def endpoint_key(method, path, query):
+    return "%s %s%s" % (method, path, "?" + query if query else "")
+
+
+def request_endpoint(request_info):
+    url = request_info.getUrl()
+    return endpoint_key(request_info.getMethod(), url.getPath(), url.getQuery())
+
+
+def url_text(url):
+    """URL as users write it: Burp's getUrl() spells out default ports (https://h:443/)."""
+    default = {"http": 80, "https": 443}.get(url.getProtocol())
+    port = "" if url.getPort() in (-1, default) else ":%d" % url.getPort()
+    query = "?" + url.getQuery() if url.getQuery() else ""
+    return "%s://%s%s%s%s" % (url.getProtocol(), url.getHost(), port, url.getPath(), query)
+
+
+def status_code(helpers, response):
+    return str(helpers.analyzeResponse(response).getStatusCode())
+
+
+def group_endpoints(endpoints):
+    """Map each base endpoint (method + path) to its full variants, in first-seen order."""
+    groups = OrderedDict()
+    for endpoint in endpoints:
+        groups.setdefault(endpoint.split("?", 1)[0], []).append(endpoint)
+    return groups
+
+
+def _split_header(header):
+    name, sep, value = header.partition(":")
+    return (name.strip().lower(), value.strip()) if sep else (None, None)
+
+
+def _parse_cookies(value):
+    """Split a Cookie header value into [name, value] pairs; value is None for bare flags."""
+    pairs = []
+    for part in value.split(";"):
+        name, sep, val = part.strip().partition("=")
+        if name:
+            pairs.append([name.strip(), val.strip() if sep else None])
+    return pairs
+
+
+def _format_cookies(pairs):
+    return "; ".join(name if val is None else "%s=%s" % (name, val) for name, val in pairs)
+
+
+def extract_token(headers, location, cookie_name):
+    """Return the JWT found in the configured location, or None."""
+    for header in headers:
+        name, value = _split_header(header)
+        if location == LOCATION_AUTH and name == "authorization":
+            parts = value.split()
+            if len(parts) >= 2 and parts[0].lower() == "bearer":
+                return parts[1]
+        elif location == LOCATION_COOKIE and name == "cookie":
+            for cookie, token in _parse_cookies(value):
+                if cookie == cookie_name and token:
+                    return token
+    return None
+
+
+def replace_token(headers, token, location, cookie_name):
+    """Return a copy of the request headers carrying `token` in the configured location."""
+    result, replaced, cookie_index = [], False, None
+    for header in headers:
+        name, value = _split_header(header)
+        if location == LOCATION_AUTH and name == "authorization":
+            header, replaced = "Authorization: Bearer %s" % token, True
+        elif location == LOCATION_COOKIE and name == "cookie":
+            pairs = _parse_cookies(value)
+            for pair in pairs:
+                if pair[0] == cookie_name:
+                    pair[1], replaced = token, True
+            header = "Cookie: " + _format_cookies(pairs)
+            if cookie_index is None:
+                cookie_index = len(result)
+        result.append(header)
+
+    if not replaced:
+        if location == LOCATION_AUTH:
+            result.append("Authorization: Bearer %s" % token)
+        elif cookie_index is not None:
+            result[cookie_index] += "; %s=%s" % (cookie_name, token)
+        else:
+            result.append("Cookie: %s=%s" % (cookie_name, token))
+    return result
+
+
+def jwt_claim(token, claim):
+    """Read a (dot-separated) claim from the JWT payload without verifying it; None if absent."""
+    try:
+        payload = token.split(".")[1]
+        value = json.loads(base64.urlsafe_b64decode(str(payload + "=" * (-len(payload) % 4))))
+        for key in claim.split("."):
+            value = value[key]
+    except Exception:
+        return None
+    if value is None:
+        return None
+    if isinstance(value, (dict, list)):
+        return json.dumps(value, sort_keys=True)
+    return unicode(value)
+
+
+def code_matches(code, pattern):
+    pattern = pattern.strip().lower()
+    if len(pattern) == 3 and pattern.endswith("xx"):
+        return code[:1] == pattern[0]
+    return code == pattern
+
+
+def group_matches(codes, pattern):
+    """Single patterns must match every code; combined patterns need each part present."""
+    if "," in pattern:
+        return all(any(code_matches(code, part) for code in codes) for part in pattern.split(","))
+    return all(code_matches(code, pattern) for code in codes)
+
+
+def pick_group(codes, groups):
+    """Choose the colour group for a cell's status codes.
+
+    The fully matching group with the most combined parts wins; otherwise fall back to the
+    last group matching at least one code (so a 200/403 mix shows as 4xx by default).
+    """
+    best, best_parts, fallback = None, -1, None
+    for group in groups:
+        pattern = group[0]
+        if group_matches(codes, pattern):
+            if pattern.count(",") > best_parts:
+                best, best_parts = group, pattern.count(",")
+            fallback = group
+        elif any(code_matches(code, pattern) for code in codes):
+            fallback = group
+    return best or fallback
+
+
+def format_code_groups(groups):
+    return "\n".join("%s:0x%06x:%s" % group for group in groups)
+
+
+def parse_code_groups(text):
+    """Parse `pattern:COLOR:label` lines. Returns (groups, error messages)."""
+    groups, errors = [], []
+    for number, line in enumerate(text.splitlines(), 1):
+        line = line.strip()
+        if not line:
+            continue
+        parts = line.split(":", 2)
         try:
-            if col == 0:
-                c.setBackground(DefaultTableCellRenderer().getBackground())  # keep default background for endpoint column
-            else:
-                # Parse the value to determine color
-                # value format: "200: 5, 403: 2" or "0" if no requests
-                if value == "0" or value == "" or value == "No requests":
-                    c.setBackground(self.extender.color_no_requests_group[0])
-                else:
-                    # Extract all codes present in this cell
-                    codes = []
-                    parts = str(value).split(',')
-                    for part in parts:
-                        if ':' in part:
-                            code = part.split(':')[0].strip()
-                            codes.append(code)
-                    
-                    # Find the best matching group (prioritize more specific patterns)
-                    best_match = None
-                    best_specificity = -1
-                    last_matched_group = None  # Fallback to last matching group
-                    
-                    for group_pattern, (color, label) in self.extender.code_color_groups.items():
-                        # Check if codes match this group pattern (all codes must match)
-                        if self.extender._matches_code_group_pattern(codes, group_pattern):
-                            # More specific patterns (with commas) get higher priority
-                            specificity = group_pattern.count(',')
-                            if specificity > best_specificity:
-                                best_specificity = specificity
-                                best_match = group_pattern
-                            # Track the last matched group as fallback
-                            last_matched_group = group_pattern
-                        # Also track if ANY code matches this group (for fallback)
-                        elif any(self.extender._matches_code_pattern(code, group_pattern) for code in codes):
-                            last_matched_group = group_pattern
-                    
-                    if best_match:
-                        c.setBackground(self.extender.code_color_groups[best_match][0])
-                    elif last_matched_group:
-                        # Fallback: use the last matched group's color
-                        c.setBackground(self.extender.code_color_groups[last_matched_group][0])
-                    else:
-                        c.setBackground(Color.WHITE)
+            pattern = parts[0].strip()
+            rgb = int(parts[1].strip().lstrip("#"), 16)
+            if not pattern or not 0 <= rgb <= 0xFFFFFF:
+                raise ValueError()
+        except (IndexError, ValueError):
+            errors.append("Line %d: %s" % (number, line))
+            continue
+        label = parts[2].strip() if len(parts) > 2 else ""
+        groups.append((pattern, rgb, label or pattern))
+    return groups, errors
 
-        except:
-            c.setBackground(Color.WHITE)
-        return c
 
-class JwtMatrixModel(AbstractTableModel):
+def format_codes(codes):
+    if not codes:
+        return "0"
+    return ", ".join("%s: %d" % item for item in sorted(codes.items()))
+
+
+def matrix_to_csv(snapshot):
+    endpoints, users, counts = snapshot
+
+    def quote(value):
+        return '"%s"' % value.replace('"', '""')
+    lines = [",".join(quote(h) for h in ["Endpoint"] + list(users))]
+    for endpoint in endpoints:
+        row = counts.get(endpoint, {})
+        lines.append(",".join([quote(endpoint)] + [quote(format_codes(row.get(u))) for u in users]))
+    return "\n".join(lines)
+
+
+def matrix_to_json(snapshot, user_claim):
+    endpoints, users, counts = snapshot
+    return json.dumps({
+        "jwt_field": user_claim,
+        "users": users,
+        "endpoints": [{"endpoint": endpoint,
+                       "users": dict((u, counts.get(endpoint, {}).get(u, {})) for u in users)}
+                      for endpoint in endpoints],
+    }, indent=2)
+
+
+# =============================================================================
+# State
+# =============================================================================
+
+class MatrixStore(object):
+    """Thread-safe (endpoint, user) -> [(status code, message)] record, in first-seen order."""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self.clear()
+
+    def clear(self):
+        with self._lock:
+            self._endpoints = OrderedDict()   # used as ordered sets
+            self._users = OrderedDict()
+            self._cells = {}                  # (endpoint, user) -> [(code, message)]
+            self._counts = {}                 # endpoint -> user -> Counter(code)
+
+    def add_user(self, user):
+        with self._lock:
+            self._users[user] = None
+
+    def add(self, endpoint, user, code, message):
+        with self._lock:
+            self._endpoints[endpoint] = None
+            self._users[user] = None
+            self._cells.setdefault((endpoint, user), []).append((code, message))
+            self._counts.setdefault(endpoint, {}).setdefault(user, Counter())[code] += 1
+
+    def remove(self, endpoints):
+        with self._lock:
+            for endpoint in endpoints:
+                self._endpoints.pop(endpoint, None)
+                self._counts.pop(endpoint, None)
+            self._cells = dict((key, entries) for key, entries in self._cells.items()
+                               if key[0] in self._endpoints)
+
+    def snapshot(self):
+        """Return (endpoints, users, counts) where counts[endpoint][user][code] = n."""
+        with self._lock:
+            counts = dict((endpoint, dict((user, dict(codes)) for user, codes in row.items()))
+                          for endpoint, row in self._counts.items())
+            return list(self._endpoints), list(self._users), counts
+
+    def messages(self, endpoints, user):
+        with self._lock:
+            return [msg for endpoint in endpoints
+                    for _, msg in self._cells.get((endpoint, user), [])]
+
+    def all_messages(self):
+        """Every stored message once, ordered by endpoint then user."""
+        with self._lock:
+            seen, result = set(), []
+            for endpoint in self._endpoints:
+                for user in self._users:
+                    for _, msg in self._cells.get((endpoint, user), []):
+                        if id(msg) not in seen:
+                            seen.add(id(msg))
+                            result.append(msg)
+            return result
+
+
+class Settings(object):
+    """User preferences, persisted in Burp's extension settings. Tokens are never persisted."""
+
+    KEY = "settings"
+    DEFAULTS = OrderedDict([
+        ("listen_proxy", True),
+        ("listen_repeater", True),
+        ("listen_intruder", True),
+        ("location", LOCATION_AUTH),
+        ("cookie_name", DEFAULT_COOKIE_NAME),
+        ("user_claim", "sub"),
+        ("replay_threads", 5),
+        ("history_url_filter", ""),
+        ("code_groups", DEFAULT_CODE_GROUPS),
+        ("no_requests_color", DEFAULT_NO_REQUESTS_COLOR),
+    ])
+
+    def __init__(self, callbacks):
+        self._callbacks = callbacks
+        for name, value in self.DEFAULTS.items():
+            setattr(self, name, list(value) if isinstance(value, list) else value)
+        try:
+            self._load(json.loads(callbacks.loadExtensionSetting(self.KEY) or "{}"))
+        except Exception as e:
+            log("Ignoring unreadable saved settings: %s" % e)
+
+    def _load(self, saved):
+        for name, default in self.DEFAULTS.items():
+            if name not in saved:
+                continue
+            value = saved[name]
+            try:
+                if name == "code_groups":
+                    value = [(unicode(p), int(rgb), unicode(label)) for p, rgb, label in value]
+                elif isinstance(default, bool):
+                    value = bool(value)
+                elif isinstance(default, int):
+                    value = int(value)
+                elif not isinstance(value, basestring):
+                    raise TypeError("expected text")
+            except (TypeError, ValueError) as e:
+                log("Ignoring saved setting %s: %s" % (name, e))
+                continue
+            setattr(self, name, value)
+        if self.location not in (LOCATION_AUTH, LOCATION_COOKIE):
+            self.location = LOCATION_AUTH
+        self.replay_threads = min(max(self.replay_threads, 1), MAX_REPLAY_THREADS)
+
+    def save(self):
+        data = dict((name, getattr(self, name)) for name in self.DEFAULTS)
+        self._callbacks.saveExtensionSetting(self.KEY, json.dumps(data))
+
+    def effective_cookie_name(self):
+        return self.cookie_name.strip() or DEFAULT_COOKIE_NAME
+
+
+# =============================================================================
+# Replay
+# =============================================================================
+
+class ReplayJob(object):
+    """Re-send every captured request once per user token, on a bounded thread pool.
+
+    Results go into `store`. `on_progress(done, total)` and `on_finished(cancelled)` run on
+    the Swing event thread.
     """
-    TableModel where rows = endpoints (with expandable sub-rows for parameters), columns = users.
-    First column is 'Endpoint', others are users, cell values are response code counts.
-    """
-    def __init__(self, extender):
-        self.extender = extender
-        self.endpoints = []   # ordered list of base endpoint keys (without params)
-        self.endpoint_variants = {}  # base_endpoint -> list of full endpoints with params
-        self.users = []       # ordered list of user identifiers
-        self.data = defaultdict(lambda: defaultdict(lambda: defaultdict(int)))  # endpoint -> user -> code -> count
-        self.expanded_rows = set()  # set of base endpoints that are expanded
-        self.visible_rows = []  # actual rows to display (base + expanded children)
 
-    def _rebuild_visible_rows(self):
-        """Rebuild the list of visible rows based on expansion state."""
-        self.visible_rows = []
-        for base_endpoint in self.endpoints:
-            self.visible_rows.append(('base', base_endpoint))
-            if base_endpoint in self.expanded_rows:
-                # Add child rows
-                variants = self.endpoint_variants.get(base_endpoint, [])
-                for variant in sorted(variants):
-                    if variant != base_endpoint:  # Don't duplicate if no params
-                        self.visible_rows.append(('child', variant))
+    def __init__(self, callbacks, store, messages, tokens, location, cookie_name, threads,
+                 on_progress, on_finished):
+        self._callbacks = callbacks
+        self._helpers = callbacks.getHelpers()
+        self._store = store
+        self._messages = messages
+        self._tokens = tokens
+        self._location = location
+        self._cookie_name = cookie_name
+        self._threads = threads
+        self._on_progress = on_progress
+        self._on_finished = on_finished
+        self._executor = Executors.newFixedThreadPool(threads)
+        self._cancelled = False
+        self._done = 0
+        self._done_lock = threading.Lock()
+        self.total = len(messages) * len(tokens)
 
-    def toggle_expansion(self, row):
-        """Toggle expansion of a base endpoint row."""
-        if row < len(self.visible_rows):
-            row_type, endpoint = self.visible_rows[row]
-            if row_type == 'base':
-                if endpoint in self.expanded_rows:
-                    self.expanded_rows.remove(endpoint)
+    def start(self):
+        for user in self._tokens:
+            self._store.add_user(user)
+        worker = threading.Thread(target=self._run, name="jwt-matrix-replay")
+        worker.setDaemon(True)
+        worker.start()
+
+    def cancel(self):
+        """Skip everything not yet sent; requests already in flight finish (one per thread)."""
+        self._cancelled = True
+        self._executor.shutdown()
+
+    def _run(self):
+        try:
+            try:
+                for msg in self._messages:
+                    self._executor.execute(lambda m=msg: self._replay_message(m))
+            except RejectedExecutionException:
+                pass   # cancelled while submitting
+            self._executor.shutdown()
+            while not self._executor.awaitTermination(250, TimeUnit.MILLISECONDS):
+                pass   # requests already in flight must finish before the store is reused
+        finally:
+            SwingUtilities.invokeLater(lambda: self._on_finished(self._cancelled))
+
+    def _replay_message(self, msg):
+        """Send one captured request once per token. Runs on a pool thread."""
+        info = self._helpers.analyzeRequest(msg)
+        endpoint = request_endpoint(info)
+        headers = list(info.getHeaders())
+        body = msg.getRequest()[info.getBodyOffset():]
+        for user, token in self._tokens.items():
+            if self._cancelled:
+                return
+            try:
+                raw = self._helpers.buildHttpMessage(
+                    replace_token(headers, token, self._location, self._cookie_name), body)
+                result = self._callbacks.makeHttpRequest(msg.getHttpService(), raw)
+                response = result.getResponse() if result is not None else None
+                if response is None:
+                    log("No response for %s as %s" % (endpoint, user))
                 else:
-                    self.expanded_rows.add(endpoint)
-                self._rebuild_visible_rows()
-                self.fireTableDataChanged()
-                return True
+                    self._store.add(endpoint, user, status_code(self._helpers, response), result)
+            except Exception as e:
+                log("Error replaying %s as %s: %s" % (endpoint, user, e))
+            finally:
+                with self._done_lock:
+                    self._done += 1
+                    done = self._done
+                SwingUtilities.invokeLater(lambda: self._on_progress(done, self.total))
+
+
+# =============================================================================
+# Swing components
+# =============================================================================
+
+class _DocumentChange(DocumentListener):
+    def __init__(self, callback):
+        self._callback = callback
+
+    def insertUpdate(self, event):
+        self._callback()
+
+    def removeUpdate(self, event):
+        self._callback()
+
+    def changedUpdate(self, event):
+        self._callback()
+
+
+def on_text_change(text_component, callback):
+    text_component.getDocument().addDocumentListener(_DocumentChange(callback))
+
+
+def bold_label(text):
+    label = JLabel(text)
+    label.setFont(label.getFont().deriveFont(Font.BOLD))
+    return label
+
+
+def readable_text_color(background):
+    luminance = (0.299 * background.getRed() + 0.587 * background.getGreen()
+                 + 0.114 * background.getBlue())
+    return Color.BLACK if luminance > 140 else Color.WHITE
+
+
+class ReadOnlyTableModel(DefaultTableModel):
+    def isCellEditable(self, row, col):
         return False
 
-    def is_expandable(self, row):
-        """Check if a row can be expanded (has variants)."""
-        if row < len(self.visible_rows):
-            row_type, endpoint = self.visible_rows[row]
-            if row_type == 'base':
-                variants = self.endpoint_variants.get(endpoint, [])
-                return len(variants) > 1 or (len(variants) == 1 and variants[0] != endpoint)
-        return False
 
-    def is_expanded(self, row):
-        """Check if a row is currently expanded."""
-        if row < len(self.visible_rows):
-            row_type, endpoint = self.visible_rows[row]
-            if row_type == 'base':
-                return endpoint in self.expanded_rows
-        return False
+class TokenTableModel(DefaultTableModel):
+    """User -> JWT used for replay. Filled from captured traffic and editable by hand."""
 
-    # helpers to update data
-    def set_matrix(self, endpoints, endpoint_variants, users, data):
-        self.endpoints = endpoints
-        self.endpoint_variants = endpoint_variants
-        self.users = users
-        self.data = data
-        self._rebuild_visible_rows()
-        self.fireTableStructureChanged()
+    def __init__(self):
+        DefaultTableModel.__init__(self, ["User", "JWT Token", "Last Seen"], 0)
 
-    def update_cell(self, endpoint, user, response_code, inc=1):
-        # This method is not used anymore but kept for compatibility
-        pass
+    def isCellEditable(self, row, col):
+        return col < 2
 
-    # AbstractTableModel methods
+    def upsert(self, user, token, seen):
+        for row in range(self.getRowCount()):
+            if self.getValueAt(row, 0) == user:
+                self.setValueAt(token, row, 1)
+                self.setValueAt(seen, row, 2)
+                return
+        self.addRow([user, token, seen])
+
+    def tokens(self):
+        tokens = OrderedDict()
+        for row in range(self.getRowCount()):
+            user = (self.getValueAt(row, 0) or "").strip()
+            token = (self.getValueAt(row, 1) or "").strip()
+            if user and token:
+                tokens[user] = token
+        return tokens
+
+
+class MatrixTableModel(AbstractTableModel):
+    """Rows are base endpoints (method + path), expandable into their query-string variants;
+    columns are users; cells show status code counts."""
+
+    BASE, CHILD = "base", "child"
+
+    def __init__(self):
+        self._users = []
+        self._counts = {}
+        self._groups = OrderedDict()
+        self._expanded = set()
+        self._rows = []   # (kind, label endpoint, endpoints aggregated by the row)
+        self._row_codes = []   # per row, per user: {code: count}
+
+    def load(self, endpoints, users, counts):
+        structure_changed = users != self._users
+        self._users, self._counts = users, counts
+        self._groups = group_endpoints(endpoints)
+        self._expanded &= set(self._groups)
+        self._rebuild_rows()
+        if structure_changed:
+            self.fireTableStructureChanged()
+        else:
+            self.fireTableDataChanged()
+
+    def _expandable(self, base):
+        return self._groups[base] != [base]
+
+    def _rebuild_rows(self):
+        rows = []
+        for base, variants in self._groups.items():
+            rows.append((self.BASE, base, variants))
+            if base in self._expanded:
+                rows.extend((self.CHILD, variant, [variant]) for variant in variants)
+        self._rows = rows
+        self._row_codes = [[self._aggregate(endpoints, user) for user in self._users]
+                           for _, _, endpoints in rows]
+
+    def _aggregate(self, endpoints, user):
+        total = Counter()
+        for endpoint in endpoints:
+            total.update(self._counts.get(endpoint, {}).get(user, {}))
+        return total
+
+    def toggle(self, row):
+        """Expand or collapse a base row; returns False when the row cannot expand."""
+        kind, endpoint, _ = self._rows[row]
+        if kind != self.BASE or not self._expandable(endpoint):
+            return False
+        self._expanded ^= set([endpoint])
+        self._rebuild_rows()
+        self.fireTableDataChanged()
+        return True
+
+    def row_key(self, row):
+        return self._rows[row][:2]
+
+    def endpoints_at(self, row):
+        return self._rows[row][2]
+
+    def label_at(self, row):
+        return self._rows[row][1]
+
+    def user_at(self, col):
+        return self._users[col - 1]
+
+    def codes_at(self, row, col):
+        return self._row_codes[row][col - 1]
+
+    def base_count(self):
+        return len(self._groups)
+
     def getRowCount(self):
-        return len(self.visible_rows)
+        return len(self._rows)
 
     def getColumnCount(self):
-        # first column is Endpoint
-        return 1 + len(self.users)
+        return 1 + len(self._users)
+
+    def getColumnClass(self, col):
+        # Status columns get their own class so only they use MatrixCellRenderer.
+        return Object if col == 0 else String
 
     def getColumnName(self, col):
-        if col == 0:
-            return "Endpoint"
-        else:
-            return self.users[col - 1]
+        return "Endpoint" if col == 0 else self.user_at(col)
 
     def getValueAt(self, row, col):
-        if row >= len(self.visible_rows):
-            return ""
-        
-        row_type, endpoint = self.visible_rows[row]
-        
-        if col == 0:
-            # Endpoint column
-            if row_type == 'base':
-                # Check if expandable
-                if self.is_expandable(row):
-                    icon = "[-] " if self.is_expanded(row) else "[+] "
-                    return icon + endpoint
-                else:
-                    return endpoint
-            else:  # child
-                return "    " + endpoint  # Indent child rows
-        
-        user = self.users[col - 1]
-        
-        if row_type == 'base':
-            # Aggregate data from all variants
-            variants = self.endpoint_variants.get(endpoint, [endpoint])
-            aggregated_codes = defaultdict(int)
-            for variant in variants:
-                code_dict = self.data.get(variant, {}).get(user, {})
-                for code, count in code_dict.items():
-                    aggregated_codes[code] += count
-            
-            if not aggregated_codes:
-                return "0"
-            
-            sorted_codes = sorted(aggregated_codes.items())
-            return ", ".join(["%s: %d" % (code, count) for code, count in sorted_codes])
-        else:  # child
-            # Show data for specific variant
-            code_dict = self.data.get(endpoint, {}).get(user, {})
-            
-            if not code_dict:
-                return "0"
-            
-            sorted_codes = sorted(code_dict.items())
-            return ", ".join(["%s: %d" % (code, count) for code, count in sorted_codes])
+        if col > 0:
+            return format_codes(self.codes_at(row, col))
+        kind, endpoint, _ = self._rows[row]
+        if kind == self.CHILD:
+            return "    " + endpoint
+        if self._expandable(endpoint):
+            return ("[-] " if endpoint in self._expanded else "[+] ") + endpoint
+        return endpoint
 
-class ReplayTaskCallable(Callable):
-    """Callable wrapper for replaying a single request with a specific token."""
-    def __init__(self, extender, req, endpoint, user, token, headers, analyzed_req, progress, progress_counter, total_requests, replay_lock):
-        self.extender = extender
-        self.req = req
-        self.endpoint = endpoint
-        self.user = user
-        self.token = token
-        self.headers = headers
-        self.analyzed_req = analyzed_req
-        self.progress = progress
-        self.progress_counter = progress_counter
-        self.total_requests = total_requests
-        self.replay_lock = replay_lock
-    
-    def call(self):
-        """Execute the replay task."""
-        try:
-            # Create new request with replaced JWT
-            new_headers = []
-            if self.extender.jwt_location_auth.isSelected():
-                # Replace Authorization header
-                auth_found = False
-                for header in self.headers:
-                    if header.lower().startswith("authorization:"):
-                        new_headers.append("Authorization: Bearer %s" % self.token)
-                        auth_found = True
-                    else:
-                        new_headers.append(header)
-                if not auth_found:
-                    new_headers.append("Authorization: Bearer %s" % self.token)
-            else:
-                # Replace Cookie
-                cookie_name = self.extender.cookie_name_field.getText().strip() or "jwt"
-                cookie_found = False
-                for header in self.headers:
-                    if header.lower().startswith("cookie:"):
-                        cookies = header.split(":",1)[1].strip().split(";")
-                        new_cookies = []
-                        for cookie in cookies:
-                            if "=" in cookie:
-                                name, value = cookie.split("=", 1)
-                                if name.strip() == cookie_name:
-                                    new_cookies.append("%s=%s" % (name.strip(), self.token))
-                                    cookie_found = True
-                                else:
-                                    new_cookies.append(cookie)
-                        new_headers.append("Cookie: %s" % "; ".join(new_cookies))
-                    else:
-                        new_headers.append(header)
-                if not cookie_found:
-                    new_headers.append("Cookie: %s=%s" % (cookie_name, self.token))
 
-            # Build new request
-            body = self.req.getRequest()[self.analyzed_req.getBodyOffset():]
-            new_request = self.extender._helpers.buildHttpMessage(new_headers, body)
+class _FilterOnlySorter(TableRowSorter):
+    """Filtering without sorting: sorting would separate variant rows from their base row."""
 
-            # Make request
-            response = self.extender._callbacks.makeHttpRequest(
-                self.req.getHttpService(),
-                new_request
-            )
+    def isSortable(self, column):
+        return False
 
-            # Skip if makeHttpRequest returned None or no response bytes
-            if response is None:
-                print("No response received for request to %s with user %s" % (self.endpoint, self.user))
-            else:
-                resp_bytes = None
-                try:
-                    resp_bytes = response.getResponse()
-                except:
-                    resp_bytes = None
-                
-                if resp_bytes is None:
-                    print("No response bytes for request to %s with user %s" % (self.endpoint, self.user))
-                else:
-                    # Process response
-                    analyzed_resp = self.extender._helpers.analyzeResponse(response.getResponse())
-                    response_code = str(analyzed_resp.getStatusCode())
 
-                    # Update replay matrix (thread-safe with lock)
-                    self.replay_lock.lock()
-                    try:
-                        self.extender.replay_matrix[self.endpoint][self.user][response_code] += 1
-                        self.extender.replay_request_details[self.endpoint][self.user][response_code].append(response)
-                    finally:
-                        self.replay_lock.unlock()
-        
-        except Exception as e:
-            print("Error replaying request to %s with user %s: %s" % (self.endpoint, self.user, str(e)))
-        
-        finally:
-            # Update progress counter
-            self.progress_counter.incrementAndGet()
-            current = self.progress_counter.get()
-            SwingUtilities.invokeLater(lambda: self.extender._update_replay_progress(self.progress, current, self.total_requests))
-        
-        return None
+class MatrixCellRenderer(DefaultTableCellRenderer):
+    def __init__(self, settings):
+        DefaultTableCellRenderer.__init__(self)
+        self._settings = settings
 
-class CellClickListener(MouseAdapter):
-    def __init__(self, extender):
-        self.extender = extender
-    
+    def getTableCellRendererComponent(self, table, value, selected, focused, row, col):
+        component = DefaultTableCellRenderer.getTableCellRendererComponent(
+            self, table, value, selected, focused, row, col)
+        codes = table.getModel().codes_at(table.convertRowIndexToModel(row),
+                                          table.convertColumnIndexToModel(col))
+        if not codes:
+            rgb = self._settings.no_requests_color
+        else:
+            group = pick_group(codes.keys(), self._settings.code_groups)
+            rgb = group[1] if group else 0xFFFFFF
+        background = Color(rgb).darker() if selected else Color(rgb)
+        component.setBackground(background)
+        component.setForeground(readable_text_color(background))
+        return component
+
+
+class _MatrixMouse(MouseAdapter):
+    def __init__(self, view):
+        self._view = view
+
+    def mousePressed(self, event):
+        self._view.on_mouse(event)
+
+    def mouseReleased(self, event):
+        self._view.on_mouse(event)
+
     def mouseClicked(self, event):
-        table = event.getSource()
-        row = table.rowAtPoint(event.getPoint())
-        col = table.columnAtPoint(event.getPoint())
-        
-        # Handle right click
-        if event.getButton() == MouseEvent.BUTTON3 and row >= 0:  # BUTTON3 is right click
-            # Ensure the clicked row is selected
-            if not table.isRowSelected(row):
-                table.setRowSelectionInterval(row, row)
-            
-            # Get all selected rows
-            selected_rows = table.getSelectedRows()
-            
-            if len(selected_rows) > 0:
-                # Create popup menu
-                popup = JPopupMenu()
-                
-                if len(selected_rows) == 1:
-                    deleteItem = JMenuItem("Delete endpoint")
-                else:
-                    deleteItem = JMenuItem("Delete %d endpoints" % len(selected_rows))
-                
-                deleteItem.addActionListener(lambda e: self.deleteMultipleEndpoints(table, selected_rows))
-                popup.add(deleteItem)
-                
-                # Show popup menu
-                popup.show(event.getComponent(), event.getX(), event.getY())
+        self._view.on_click(event)
+
+
+class _SwatchClick(MouseAdapter):
+    def __init__(self, callback):
+        self._callback = callback
+
+    def mouseClicked(self, event):
+        self._callback()
+
+
+class MatrixView(object):
+    """Filterable matrix table with colour legend, stats and export, bound to a MatrixStore."""
+
+    def __init__(self, extender, store, name, toolbar_controls=()):
+        self._ext = extender
+        self.store = store
+        self._name = name
+        self._refresh_lock = threading.Lock()
+        self._refresh_pending = False
+
+        self.model = MatrixTableModel()
+        self.table = JTable(self.model)
+        self._sorter = _FilterOnlySorter(self.model)
+        self.table.setRowSorter(self._sorter)
+        self.table.setDefaultRenderer(String, MatrixCellRenderer(extender.settings))
+        self.table.setRowHeight(30)
+        self.table.getTableHeader().setReorderingAllowed(False)
+        self.table.setSelectionMode(ListSelectionModel.MULTIPLE_INTERVAL_SELECTION)
+        self.table.addMouseListener(_MatrixMouse(self))
+
+        self._filter = JTextField()
+        on_text_change(self._filter, self._apply_filter)
+        toolbar = JPanel(BorderLayout(8, 0))
+        toolbar.add(JLabel("Filter endpoints: "), BorderLayout.WEST)
+        toolbar.add(self._filter, BorderLayout.CENTER)
+        if toolbar_controls:
+            controls = JPanel(FlowLayout(FlowLayout.RIGHT, 6, 0))
+            for control in toolbar_controls:
+                controls.add(control)
+            toolbar.add(controls, BorderLayout.EAST)
+
+        self._stats = JLabel()
+        self._legend = JPanel(FlowLayout(FlowLayout.LEFT, 8, 0))
+        exports = JPanel(FlowLayout(FlowLayout.RIGHT, 6, 0))
+        exports.add(JButton("Export CSV", actionPerformed=lambda e: self._export("csv")))
+        exports.add(JButton("Export JSON", actionPerformed=lambda e: self._export("json")))
+        bottom = JPanel(BorderLayout())
+        bottom.add(self._stats, BorderLayout.WEST)
+        bottom.add(self._legend, BorderLayout.CENTER)
+        bottom.add(exports, BorderLayout.EAST)
+
+        self.component = JPanel(BorderLayout(0, 4))
+        self.component.add(toolbar, BorderLayout.NORTH)
+        self.component.add(JScrollPane(self.table), BorderLayout.CENTER)
+        self.component.add(bottom, BorderLayout.SOUTH)
+        self.rebuild_legend()
+        self.refresh()
+
+    # --- data
+
+    def schedule_refresh(self):
+        """Coalesce refreshes requested from any thread into one Swing update."""
+        with self._refresh_lock:
+            if self._refresh_pending:
                 return
-        
-        # Handle left click (existing logic)
+            self._refresh_pending = True
+        SwingUtilities.invokeLater(self.refresh)
+
+    def refresh(self):
+        with self._refresh_lock:
+            self._refresh_pending = False
+        endpoints, users, counts = self.store.snapshot()
+        self._keeping_selection(lambda: self.model.load(endpoints, users, counts))
+        self._stats.setText("  Endpoints: %d (base: %d)   Users: %d  " % (
+            len(endpoints), self.model.base_count(), len(users)))
+
+    def _apply_filter(self):
+        text = self._filter.getText().strip()
+        self._sorter.setRowFilter(
+            RowFilter.regexFilter("(?i)" + Pattern.quote(text), [0]) if text else None)
+
+    def endpoints_for_rows(self, model_rows):
+        endpoints = set()
+        for row in model_rows:
+            endpoints.update(self.model.endpoints_at(row))
+        return endpoints
+
+    def delete_endpoints(self, endpoints):
+        self.store.remove(endpoints)
+        self.refresh()
+
+    def _keeping_selection(self, change):
+        """Run a model change, then reselect the rows that were selected before it."""
+        selected = set(self.model.row_key(self.table.convertRowIndexToModel(r))
+                       for r in self.table.getSelectedRows())
+        change()
+        for row in range(self.model.getRowCount()):
+            if self.model.row_key(row) in selected:
+                view_row = self.table.convertRowIndexToView(row)
+                if view_row >= 0:
+                    self.table.addRowSelectionInterval(view_row, view_row)
+
+    # --- mouse
+
+    def on_mouse(self, event):
+        if not event.isPopupTrigger():
+            return
+        row = self.table.rowAtPoint(event.getPoint())
+        if row < 0:
+            return
+        if not self.table.isRowSelected(row):
+            self.table.setRowSelectionInterval(row, row)
+        rows = self.table.getSelectedRows()
+        # Resolve endpoints now: live traffic may reorder rows before the menu is clicked.
+        endpoints = self.endpoints_for_rows([self.table.convertRowIndexToModel(r) for r in rows])
+        popup = JPopupMenu()
+        label = "Delete endpoint" if len(rows) == 1 else "Delete %d rows" % len(rows)
+        popup.add(JMenuItem(label, actionPerformed=lambda e: self.delete_endpoints(endpoints)))
+        popup.show(event.getComponent(), event.getX(), event.getY())
+
+    def on_click(self, event):
+        if not SwingUtilities.isLeftMouseButton(event):
+            return
+        row = self.table.rowAtPoint(event.getPoint())
+        col = self.table.columnAtPoint(event.getPoint())
+        if row < 0 or col < 0:
+            return
+        row = self.table.convertRowIndexToModel(row)
+        col = self.table.convertColumnIndexToModel(col)
         if col == 0:
-            # Clicked on endpoint column - toggle expansion
-            model_row = table.convertRowIndexToModel(row)
-            if self.extender.table_model.toggle_expansion(model_row):
-                return  # Expansion toggled, don't show details
-        
-        # Don't process clicks on endpoint column for details
-        if col > 0 and row >= 0:
-            # Get actual row index (accounting for sorting/filtering)
-            model_row = table.convertRowIndexToModel(row)
-            if model_row < len(self.extender.table_model.visible_rows):
-                row_type, endpoint = self.extender.table_model.visible_rows[model_row]
-                user = self.extender.table_model.users[col - 1]
-                
-                # For base rows, show aggregated details
-                if row_type == 'base':
-                    variants = self.extender.table_model.endpoint_variants.get(endpoint, [endpoint])
-                    self.extender._show_aggregated_request_details(variants, user)
-                else:
-                    # For child rows, show specific endpoint details
-                    self.extender._show_request_details(endpoint, user)
+            if not (event.isControlDown() or event.isShiftDown()):   # those extend selection
+                self._keeping_selection(lambda: self.model.toggle(row))
+            return
+        user = self.model.user_at(col)
+        self._ext.show_messages("%s: %s as %s" % (self._name, self.model.label_at(row), user),
+                                self.store.messages(self.model.endpoints_at(row), user))
 
-    def deleteMultipleEndpoints(self, table, selected_rows):
-        """Delete multiple selected endpoints."""
-        try:
-            # Collect all endpoints to delete from selected rows
-            endpoints_to_delete = set()
-            row_types_to_delete = {}
-            
-            for row in selected_rows:
-                model_row = table.convertRowIndexToModel(row)
-                if model_row < len(self.extender.table_model.visible_rows):
-                    row_type, endpoint = self.extender.table_model.visible_rows[model_row]
-                    endpoints_to_delete.add(endpoint)
-                    row_types_to_delete[endpoint] = row_type
-            
-            # Delete each endpoint
-            for endpoint in endpoints_to_delete:
-                row_type = row_types_to_delete[endpoint]
-                self._delete_single_endpoint(endpoint, row_type)
-            
-            # Update the table once after all deletions
-            SwingUtilities.invokeLater(lambda: self.extender._update_table_model())
-            
-        except Exception as e:
-            print("Error deleting endpoints: %s" % str(e))
+    # --- legend & export
 
-    def _delete_single_endpoint(self, endpoint, row_type):
-        """Delete a single endpoint from data structures."""
-        try:
-            if row_type == 'base':
-                # Delete base endpoint and all its variants
-                variants = self.extender.table_model.endpoint_variants.get(endpoint, [endpoint])
-                for variant in variants:
-                    # Remove from data structures
-                    if variant in self.extender.matrix:
-                        del self.extender.matrix[variant]
-                    if variant in self.extender.request_details:
-                        del self.extender.request_details[variant]
-                    if variant in self.extender.endpoints_order:
-                        self.extender.endpoints_order.remove(variant)
-            else:
-                # Delete specific variant only
-                if endpoint in self.extender.matrix:
-                    del self.extender.matrix[endpoint]
-                if endpoint in self.extender.request_details:
-                    del self.extender.request_details[endpoint]
-                if endpoint in self.extender.endpoints_order:
-                    self.extender.endpoints_order.remove(endpoint)
-        except Exception as e:
-            print("Error deleting single endpoint: %s" % str(e))
+    def rebuild_legend(self):
+        settings = self._ext.settings
+        self._legend.removeAll()
+        self._legend.add(bold_label("Legend:"))
+        for index, (_, rgb, label) in enumerate(settings.code_groups):
+            self._legend.add(self._swatch(rgb, label, index))
+        self._legend.add(self._swatch(settings.no_requests_color, "No requests", None))
+        self._legend.revalidate()
+        self._legend.repaint()
+        self.table.repaint()
 
-class BurpExtender(IBurpExtender, IHttpListener, ITab):
-    #
-    # ITab methods - implemented first for Jython compatibility
-    #
+    def _swatch(self, rgb, label, group_index):
+        swatch = JLabel(label)
+        swatch.setOpaque(True)
+        swatch.setBackground(Color(rgb))
+        swatch.setForeground(readable_text_color(Color(rgb)))
+        swatch.setToolTipText("Click to change colour")
+        swatch.setCursor(Cursor.getPredefinedCursor(Cursor.HAND_CURSOR))
+        swatch.addMouseListener(_SwatchClick(lambda: self._ext.choose_color(group_index)))
+        return swatch
+
+    def _export(self, fmt):
+        snapshot = self.store.snapshot()
+        if not snapshot[0]:
+            JOptionPane.showMessageDialog(self.component, "The %s is empty." % self._name)
+            return
+        if fmt == "csv":
+            content = matrix_to_csv(snapshot)
+        else:
+            content = matrix_to_json(snapshot, self._ext.settings.user_claim)
+        self._ext.save_file("Save %s as %s" % (self._name, fmt.upper()), fmt, content)
+
+
+class _MessageController(IMessageEditorController):
+    """Gives Burp's message editors the selected message, for their context-menu actions."""
+
+    def __init__(self):
+        self.message = None
+
+    def getHttpService(self):
+        return self.message and self.message.getHttpService()
+
+    def getRequest(self):
+        return self.message and self.message.getRequest()
+
+    def getResponse(self):
+        return self.message and self.message.getResponse()
+
+
+# =============================================================================
+# Extension
+# =============================================================================
+
+class BurpExtender(IBurpExtender, IHttpListener, ITab, IContextMenuFactory,
+                   IExtensionStateListener):
+
+    def registerExtenderCallbacks(self, callbacks):
+        self._callbacks = callbacks
+        self._helpers = callbacks.getHelpers()
+        callbacks.setExtensionName(EXTENSION_NAME)
+
+        self.settings = Settings(callbacks)
+        self.captured = MatrixStore()
+        self.replayed = MatrixStore()
+        self.tokens = TokenTableModel()
+        self._replay_job = None
+        self._build_ui()
+
+        callbacks.registerHttpListener(self)
+        callbacks.registerContextMenuFactory(self)
+        callbacks.registerExtensionStateListener(self)
+        callbacks.addSuiteTab(self)
+        log("Loaded.")
+
+    # --- Burp interfaces
+
     def getTabCaption(self):
         return "JWT Auth Matrix"
 
     def getUiComponent(self):
         return self._panel
-    
-    def registerExtenderCallbacks(self, callbacks):
-        self._callbacks = callbacks
-        self._helpers = callbacks.getHelpers()
-        callbacks.setExtensionName("JWT Authorization Matrix")
 
-        # configuration defaults
-        self.jwt_user_field = "sub"
-        
-        # replay thread count setting
-        self.replay_thread_count = 5
-        
-        # tool listening flags (enabled by default)
-        self.listen_proxy = True
-        self.listen_repeater = True
-        self.listen_intruder = True
-        
-        # color scheme for response codes (customizable)
-        # Keep legacy color references for backward compatibility
-        self.color_success = Color(0x38, 0x77, 0x23)      # green
-        self.color_mixed = Color(0x87, 0xce, 0xeb)        # light blue
-        self.color_client_error = Color(0xff, 0xff, 0x66) # yellow
-        self.color_server_error = Color(0xff, 0x8c, 0x00) # orange
-        self.color_no_requests = Color(0xf3, 0x2a, 0x4c)  # red
-        
-        # code-to-color mappings: code_pattern -> (color, label)
-        # Patterns can be individual codes (200) or ranges (2xx, 4xx)
-        self.code_color_groups = OrderedDict([
-            ('2xx', (Color(0x38, 0x77, 0x23), 'Success (2xx)')),
-            ('3xx', (Color(0x87, 0xce, 0xeb), 'Redirect (3xx)')),
-            ('4xx', (Color(0xff, 0xff, 0x66), 'Client Error (4xx)')),
-            ('5xx', (Color(0xff, 0x8c, 0x00), 'Server Error (5xx)')),
-        ])
-        self.color_no_requests_group = (Color(0x33, 0x33, 0x33), 'No Requests')
+    def extensionUnloaded(self):
+        if self._replay_job is not None:
+            self._replay_job.cancel()
 
-        # data: endpoint -> user -> response_code -> count
-        self.matrix = defaultdict(lambda: defaultdict(lambda: defaultdict(int)))
-        # store actual request details: endpoint -> user -> response_code -> list of IHttpRequestResponse objects
-        self.request_details = defaultdict(lambda: defaultdict(lambda: defaultdict(list)))
-        self.endpoints_order = []
-        self.users_order = []
-
-        # replay data: same shape as above, populated by "Replay All Requests with JWT Tokens"
-        self.replay_matrix = defaultdict(lambda: defaultdict(lambda: defaultdict(int)))
-        self.replay_request_details = defaultdict(lambda: defaultdict(lambda: defaultdict(list)))
-        self.replay_endpoints_order = []
-        self.replay_users_order = []
-
-        # --- build UI immediately so _panel exists before Burp asks for it
-        self._build_ui()
-
-        # register listeners
-        callbacks.registerHttpListener(self)
-        callbacks.addSuiteTab(self)
-        callbacks.registerContextMenuFactory(JwtMatrixContextMenu(self))
-
-        # constants
-        self.TOOL_PROXY = callbacks.TOOL_PROXY
-        self.TOOL_REPEATER = callbacks.TOOL_REPEATER
-        self.TOOL_INTRUDER = callbacks.TOOL_INTRUDER
-
-        print("JWT Authorization Matrix loaded – listening to Proxy/Repeater/Intruder.")
-
-    #
-    # IHttpListener
-    #
-    def processHttpMessage(self, toolFlag, messageIsRequest, messageInfo):
-        # We need both request (for JWT/endpoint) and response (for status code)
-        try:
-            # Check if we should listen to this tool based on user preferences
-            should_listen = False
-            if (toolFlag & self.TOOL_PROXY) and self.listen_proxy:
-                should_listen = True
-            if (toolFlag & self.TOOL_REPEATER) and self.listen_repeater:
-                should_listen = True
-            if (toolFlag & self.TOOL_INTRUDER) and self.listen_intruder:
-                should_listen = True
-        except:
-            # fallback if constants don't behave as expected
-            should_listen = True
-
-        if not should_listen:
+    def processHttpMessage(self, tool_flag, is_request, message):
+        if is_request or not self._listens_to(tool_flag):
             return
-
-        # Only process responses (we'll get the request data from the same messageInfo)
-        if messageIsRequest:
-            return
-
         try:
-            # Get request info
-            request = messageInfo.getRequest()
-            analyzed_req = self._helpers.analyzeRequest(messageInfo)
-            headers = analyzed_req.getHeaders()
-            url = analyzed_req.getUrl()
-            method = headers[0].split(' ')[0] if headers and len(headers)>0 else "GET"
-            endpoint = "%s %s" % (method, url.getPath() + (("?" + url.getQuery()) if url.getQuery() else ""))
-            
-            # Get response code
-            response = messageInfo.getResponse()
-            if response is None:
-                return
-            analyzed_resp = self._helpers.analyzeResponse(response)
-            response_code = str(analyzed_resp.getStatusCode())
-            
-            token = None
-            if self.jwt_location_auth.isSelected():
-                # Look in Authorization header
-                for h in headers:
-                    if h.lower().startswith("authorization:"):
-                        parts = h.split(":",1)[1].strip().split()
-                        if len(parts) >= 2 and parts[0].lower() == "bearer":
-                            token = parts[1].strip()
-                            break
-            else:
-                # Look in Cookies
-                cookie_name = self.cookie_name_field.getText().strip()
-                if not cookie_name:
-                    cookie_name = "jwt"
-                
-                for h in headers:
-                    if h.lower().startswith("cookie:"):
-                        cookies = h.split(":",1)[1].strip().split(";")
-                        for cookie in cookies:
-                            if "=" in cookie:
-                                name, value = cookie.split("=", 1)
-                                if name.strip() == cookie_name:
-                                    token = value.strip()
-                                    break
-                        if token:
-                            break
-            
-            if not token:
-                return
-            
-            user = self._parse_jwt_get_field(token, self.jwt_user_field)
-            if user is None:
-                user = "<no-%s>" % self.jwt_user_field
-            
-            # update internal matrix
-            # ensure stable ordering
-            if endpoint not in self.endpoints_order:
-                self.endpoints_order.append(endpoint)
-            if user not in self.users_order:
-                self.users_order.append(user)
-            self.matrix[endpoint][user][response_code] += 1
-            
-            # Store the complete IHttpRequestResponse object
-            self.request_details[endpoint][user][response_code].append(messageInfo)
-            
-            # notify table model to update
-            # UI update must be on Swing thread
-            SwingUtilities.invokeLater(lambda: self._update_table_model())
-            
-            # Also update listening preferences in case checkboxes changed
-            self._update_listening_preferences()
-            
-            # Update JWT table if we have a valid user and token
-            if user and token and not user.startswith("<no-"):
-                self._update_jwt_table(user, token)
+            if self._capture(message, persist=True):
+                self.matrix_view.schedule_refresh()
         except Exception as e:
-            # do not crash Burp; log for user
-            print("JWT Matrix: error processing message - %s" % str(e))
+            log("Error processing message: %s" % e)
 
-    #
-    # JWT parsing helper
-    #
-    def _parse_jwt_get_field(self, token, field):
-        try:
-            parts = token.split('.')
-            if len(parts) < 2:
-                return None
-            payload_b64 = parts[1]
-            # base64 urlsafe decode with padding fix
-            rem = len(payload_b64) % 4
-            if rem > 0:
-                payload_b64 += '=' * (4 - rem)
-            payload_json = base64.urlsafe_b64decode(payload_b64.encode('utf-8'))
-            payload = json.loads(payload_json.decode('utf-8'))
-            # allow dotted field like "user.name" optionally
-            if '.' in field:
-                cur = payload
-                for p in field.split('.'):
-                    if isinstance(cur, dict) and p in cur:
-                        cur = cur[p]
-                    else:
-                        return None
-                return str(cur)
-            else:
-                val = payload.get(field)
-                return None if val is None else str(val)
-        except Exception as e:
-            # silently return None when parsing fails
-            # print("JWT parse error: %s" % str(e))
-            return None
+    def createMenuItems(self, invocation):
+        items = ArrayList()
+        messages = invocation.getSelectedMessages()
+        if messages:
+            items.add(JMenuItem("Send to JWT Authorization Matrix",
+                                actionPerformed=lambda e: self.send_to_matrix(list(messages))))
+        return items
 
-    #
-    # Swing UI building
-    #
+    # --- capture
+
+    def _listens_to(self, tool_flag):
+        cb, s = self._callbacks, self.settings
+        return ((tool_flag == cb.TOOL_PROXY and s.listen_proxy)
+                or (tool_flag == cb.TOOL_REPEATER and s.listen_repeater)
+                or (tool_flag == cb.TOOL_INTRUDER and s.listen_intruder))
+
+    def _capture(self, message, persist=False, url_filter=None):
+        """Record a request/response carrying a JWT. Returns True when it was recorded."""
+        response = message.getResponse()
+        if response is None:
+            return False
+        info = self._helpers.analyzeRequest(message)
+        if url_filter is not None and not url_filter.search(url_text(info.getUrl())):
+            return False
+        token = extract_token(info.getHeaders(), self.settings.location,
+                              self.settings.effective_cookie_name())
+        if not token:
+            return False
+
+        claim = self.settings.user_claim
+        user = jwt_claim(token, claim)
+        code = status_code(self._helpers, response)
+        if persist:   # listener messages are transient; keep them on disk, not in memory
+            message = self._callbacks.saveBuffersToTempFiles(message)
+        self.captured.add(request_endpoint(info), user or "<no-%s>" % claim, code, message)
+        if user:
+            seen = Date().toString()
+            SwingUtilities.invokeLater(lambda: self.tokens.upsert(user, token, seen))
+        return True
+
+    def send_to_matrix(self, messages, on_done=None):
+        """Add selected messages to the matrix (context menu), in the background."""
+        self._capture_in_background(lambda: messages, "selected messages", on_done=on_done)
+
+    def import_history(self, url_filter=None, on_done=None):
+        """Rebuild the matrix from Proxy history in the background.
+
+        url_filter: compiled regex the full URL must match, or None for everything.
+        """
+        self.captured.clear()
+        self._capture_in_background(self._callbacks.getProxyHistory, "Proxy history items",
+                                    url_filter, on_done)
+
+    def _capture_in_background(self, load_items, description, url_filter=None, on_done=None):
+        def run():
+            added = total = 0
+            try:
+                for item in load_items():
+                    total += 1
+                    try:
+                        added += self._capture(item, url_filter=url_filter)
+                    except Exception as e:
+                        log("Skipping message: %s" % e)
+                log("Added %d of %d %s (others had no JWT, no response or no URL match)."
+                    % (added, total, description))
+            finally:
+                def finish():
+                    self.matrix_view.refresh()
+                    if on_done:
+                        on_done()
+                SwingUtilities.invokeLater(finish)
+
+        worker = threading.Thread(target=run, name="jwt-matrix-capture")
+        worker.setDaemon(True)
+        worker.start()
+
+    # --- UI
+
     def _build_ui(self):
-        # top-level panel for ITab
+        self._history_filter = JTextField(self.settings.history_url_filter, 16)
+        self._history_filter.setToolTipText(
+            "Regex on the full URL: only matching Proxy history requests are imported")
+        on_text_change(self._history_filter, lambda: self._set(
+            "history_url_filter", self._history_filter.getText()))
+        self._import_button = JButton("Rebuild from Proxy history",
+                                      actionPerformed=self._on_import_history)
+        self.matrix_view = MatrixView(self, self.captured, "Authorization matrix", [
+            JLabel("History URL regex:"), self._history_filter, self._import_button,
+            JButton("Clear", actionPerformed=lambda e: self._clear_matrix()),
+        ])
+        self.replay_view = MatrixView(self, self.replayed, "Replay matrix")
+
+        replay_split = JSplitPane(JSplitPane.VERTICAL_SPLIT, self._build_token_panel(),
+                                  self.replay_view.component)
+        replay_split.setResizeWeight(0.3)
+
+        self._tabs = JTabbedPane()
+        self._tabs.addTab("Matrix", self.matrix_view.component)
+        self._tabs.addTab("Replay", replay_split)
+        self._tabs.addTab("Settings", self._build_settings_panel())
         self._panel = JPanel(BorderLayout())
+        self._panel.add(self._tabs, BorderLayout.CENTER)
 
-        # Create tabbed pane
-        self.tabbed_pane = JTabbedPane()
+    def _set(self, name, value):
+        setattr(self.settings, name, value)
+        self.settings.save()
 
-        # === Matrix Tab ===
-        matrix_tab = self._create_matrix_tab()
-        self.tabbed_pane.addTab("Authorization Matrix", matrix_tab)
+    def _build_token_panel(self):
+        table = JTable(self.tokens)
+        table.setAutoCreateRowSorter(True)
+        table.setRowHeight(26)
+        table.getColumnModel().getColumn(1).setPreferredWidth(500)
 
-        # === Configuration Tab ===
-        config_tab = self._create_config_tab()
-        self.tabbed_pane.addTab("Configuration", config_tab)
-        
-        # === Replay Tab ===
-        replay_tab = self._create_replay_matrix_tab()
-        self.tabbed_pane.addTab("Replay Matrix", replay_tab)
+        threads = JSpinner(SpinnerNumberModel(self.settings.replay_threads, 1, MAX_REPLAY_THREADS, 1))
+        threads.addChangeListener(lambda e: self._set("replay_threads", threads.getValue()))
+        self._replay_button = JButton("Replay all captured requests with these tokens",
+                                      actionPerformed=lambda e: self._start_replay())
 
-        # Add tabbed pane to main panel
-        self._panel.add(self.tabbed_pane, BorderLayout.CENTER)
+        def delete_selected(event):
+            rows = sorted((table.convertRowIndexToModel(r) for r in table.getSelectedRows()),
+                          reverse=True)
+            for row in rows:
+                self.tokens.removeRow(row)
 
-    def _create_matrix_tab(self):
-        """Create the matrix visualization tab."""
-        matrix_panel = JPanel(BorderLayout())
+        buttons = JPanel(FlowLayout(FlowLayout.LEFT, 6, 0))
+        buttons.add(JButton("Add row", actionPerformed=lambda e: self.tokens.addRow(["", "", ""])))
+        buttons.add(JButton("Delete selected", actionPerformed=delete_selected))
+        buttons.add(Box.createHorizontalStrut(20))
+        buttons.add(JLabel("Threads:"))
+        buttons.add(threads)
+        buttons.add(self._replay_button)
 
-        # Filter panel at the top
-        filter_panel = JPanel(BorderLayout())
-        filter_panel.add(JLabel("Filter endpoints: "), BorderLayout.WEST)
-        self.filter_field = JTextField()
-        self.filter_field.getDocument().addDocumentListener(FilterListener(self))
-        filter_panel.add(self.filter_field, BorderLayout.CENTER)
-
-        # matrix model & table
-        self.table_model = JwtMatrixModel(self)
-        self.table = JTable(self.table_model)
-        self.table_sorter = TableRowSorter(self.table_model)
-        self.table.setRowSorter(self.table_sorter)
-        self.table.setDefaultRenderer(Object, ColorCellRenderer(self))  # colorize all cells
-        
-        # Increase row height for matrix table
-        self.table.setRowHeight(30)  # Set default row height
-        self.table.getTableHeader().setPreferredSize(Dimension(self.table.getTableHeader().getPreferredSize().width, 25))
-
-        # Enable multiple row selection
-        self.table.setSelectionMode(ListSelectionModel.MULTIPLE_INTERVAL_SELECTION)
-
-        # Add mouse listener for cell clicks
-        
-        self.table.addMouseListener(CellClickListener(self))
-        
-        scroll = JScrollPane(self.table)
-
-        # simple stats label
-        self.stats_label = JLabel("Endpoints: 0    Users: 0")
-
-        # Color legend panel
-        legend_panel = JPanel()
-        legend_panel.setLayout(BoxLayout(legend_panel, BoxLayout.X_AXIS))
-        label = JLabel("    Color Legend: ")
-        font = label.getFont()
-        label.setFont(Font(font.getFontName(), Font.BOLD, font.getSize()))
-        legend_panel.add(label)
-        
-        # Add color boxes for each code group
-        for group_pattern, (color, group_label) in self.code_color_groups.items():
-            legend_panel.add(self._create_color_box(color, group_label, group_pattern))
-            legend_panel.add(Box.createHorizontalStrut(10))
-        
-        # Add no requests color box
-        legend_panel.add(self._create_color_box(self.color_no_requests_group[0], self.color_no_requests_group[1], "no_requests"))
-        legend_panel.add(Box.createHorizontalGlue())
-        
-        # Store reference for legend rebuilding
-        self.legend_panel_ref = legend_panel
-
-        # Bottom panel with stats and legend
-        bottom_panel = JPanel(BorderLayout())
-        bottom_panel.add(self.stats_label, BorderLayout.WEST)
-        bottom_panel.add(legend_panel, BorderLayout.CENTER)
-
-        matrix_panel.add(filter_panel, BorderLayout.NORTH)
-        matrix_panel.add(scroll, BorderLayout.CENTER)
-        matrix_panel.add(bottom_panel, BorderLayout.SOUTH)
-
-        return matrix_panel
-
-    def _create_color_box(self, color, label, color_type):
-        """Helper to create a colored box with label for the legend."""
-        panel = JPanel()
-        panel.setLayout(BoxLayout(panel, BoxLayout.X_AXIS))
-        
-        box = JLabel("   ")
-        box.setOpaque(True)
-        box.setBackground(color)
-        box.setPreferredSize(Dimension(20, 15))
-        
-        # Make the color box clickable
-        class ColorClickListener(MouseAdapter):
-            def __init__(self, extender, color_type):
-                self.extender = extender
-                self.color_type = color_type
-            
-            def mouseClicked(self, event):
-                self.extender._on_color_change(self.color_type)
-        
-        box.addMouseListener(ColorClickListener(self, color_type))
-        box.setToolTipText("Click to change color")
-        
-        # Make cursor change to hand on hover
-        from java.awt import Cursor
-        box.setCursor(Cursor.getPredefinedCursor(Cursor.HAND_CURSOR))
-        
-        panel.add(box)
-        panel.add(Box.createHorizontalStrut(5))
-        panel.add(JLabel(label))
-        
+        panel = JPanel(BorderLayout(0, 4))
+        panel.add(bold_label("Tokens used for replay (captured automatically, editable):"),
+                  BorderLayout.NORTH)
+        panel.add(JScrollPane(table), BorderLayout.CENTER)
+        panel.add(buttons, BorderLayout.SOUTH)
         return panel
 
-    def _rebuild_legend(self):
-        """Rebuild the legend panel with current code groups."""
-        try:
-            # Find the legend panel in the bottom_panel (it's in CENTER)
-            # The matrix_panel is in tabbed_pane, and bottom_panel is in SOUTH
-            # We need to find and update the legend_panel component
-            if hasattr(self, 'legend_panel_ref'):
-                # Clear old components
-                self.legend_panel_ref.removeAll()
-                
-                # Rebuild legend
-                label = JLabel("    Color Legend: ")
-                font = label.getFont()
-                label.setFont(Font(font.getFontName(), Font.BOLD, font.getSize()))
-                self.legend_panel_ref.add(label)
-                
-                # Add color boxes for each code group
-                for group_pattern, (color, group_label) in self.code_color_groups.items():
-                    self.legend_panel_ref.add(self._create_color_box(color, group_label, group_pattern))
-                    self.legend_panel_ref.add(Box.createHorizontalStrut(10))
-                
-                # Add no requests color box
-                self.legend_panel_ref.add(self._create_color_box(self.color_no_requests_group[0], self.color_no_requests_group[1], "no_requests"))
-                self.legend_panel_ref.add(Box.createHorizontalGlue())
-                
-                self.legend_panel_ref.revalidate()
-                self.legend_panel_ref.repaint()
-        except Exception as e:
-            print("Error rebuilding legend: %s" % str(e))
+    def _build_settings_panel(self):
+        s = self.settings
+        panel = JPanel()
+        panel.setLayout(BoxLayout(panel, BoxLayout.Y_AXIS))
+        panel.setBorder(BorderFactory.createEmptyBorder(0, 12, 12, 12))
 
-    def _create_config_tab(self):
-        """Create the configuration tab."""
-        config_panel = JPanel()
-        config_panel.setLayout(BoxLayout(config_panel, BoxLayout.Y_AXIS))
-        
-        # Add padding
-        config_panel.add(Box.createVerticalStrut(20))
-        
-        # Listening Tools Section
-        tools_label = JLabel("Listen to Tools: ")
-        font = tools_label.getFont()
-        tools_label.setFont(Font(font.getFontName(), Font.BOLD, font.getSize()))
-        tools_label.setAlignmentX(0.0)
-        config_panel.add(tools_label)
-        config_panel.add(Box.createVerticalStrut(5))
-        
-        tools_desc = JLabel("Select which Burp tools to monitor for JWT requests:")
-        tools_desc.setAlignmentX(0.0)
-        config_panel.add(tools_desc)
-        config_panel.add(Box.createVerticalStrut(10))
-        
-        # Create a sub-panel for checkboxes with left padding
-        checkbox_panel = JPanel()
-        checkbox_panel.setLayout(BoxLayout(checkbox_panel, BoxLayout.Y_AXIS))
-        checkbox_panel.setAlignmentX(0.0)
-        
-        self.proxy_checkbox = JCheckBox("Proxy", self.listen_proxy, actionPerformed=lambda e: self._update_listening_preferences())
-        self.proxy_checkbox.setAlignmentX(0.0)
-        checkbox_panel.add(self.proxy_checkbox)
-        checkbox_panel.add(Box.createVerticalStrut(5))
-        
-        self.repeater_checkbox = JCheckBox("Repeater", self.listen_repeater, actionPerformed=lambda e: self._update_listening_preferences())
-        self.repeater_checkbox.setAlignmentX(0.0)
-        checkbox_panel.add(self.repeater_checkbox)
-        checkbox_panel.add(Box.createVerticalStrut(5))
-        
-        self.intruder_checkbox = JCheckBox("Intruder", self.listen_intruder, actionPerformed=lambda e: self._update_listening_preferences())
-        self.intruder_checkbox.setAlignmentX(0.0)
-        checkbox_panel.add(self.intruder_checkbox)
-        
-        config_panel.add(checkbox_panel)
-        
-        config_panel.add(Box.createVerticalStrut(30))
-        
-        # JWT Location Configuration
-        location_label = JLabel("JWT Token Location: ")
-        font = location_label.getFont()
-        location_label.setFont(Font(font.getFontName(), Font.BOLD, font.getSize()))
-        location_label.setAlignmentX(0.0)
-        config_panel.add(location_label)
-        config_panel.add(Box.createVerticalStrut(5))
-        
-        location_desc = JLabel("Specify where to look for the JWT token:")
-        location_desc.setAlignmentX(0.0)
-        config_panel.add(location_desc)
-        config_panel.add(Box.createVerticalStrut(10))
-        
-        # Create radio buttons
-        self.jwt_location_auth = JRadioButton("Authorization Header (Bearer token)", True)
-        self.jwt_location_auth.setAlignmentX(0.0)
-        self.jwt_location_cookie = JRadioButton("Cookie", False)
-        self.jwt_location_cookie.setAlignmentX(0.0)
-        
-        # Cookie name field
-        cookie_panel = JPanel()
-        cookie_panel.setLayout(BoxLayout(cookie_panel, BoxLayout.X_AXIS))
-        cookie_panel.setAlignmentX(0.0)
-        self.cookie_name_field = JTextField("jwt", 20)
-        self.cookie_name_field.setMaximumSize(Dimension(200, 25))
-        cookie_panel.add(Box.createHorizontalStrut(20))
-        cookie_panel.add(JLabel("Cookie name: "))
-        cookie_panel.add(self.cookie_name_field)
-        cookie_panel.add(Box.createHorizontalGlue())
-        
-        # Group radio buttons
-        button_group = ButtonGroup()
-        button_group.add(self.jwt_location_auth)
-        button_group.add(self.jwt_location_cookie)
-        
-        config_panel.add(self.jwt_location_auth)
-        config_panel.add(Box.createVerticalStrut(5))
-        config_panel.add(self.jwt_location_cookie)
-        config_panel.add(cookie_panel)
-        
-        config_panel.add(Box.createVerticalStrut(30))
-        
-        # JWT Field Configuration
-        field_label = JLabel("JWT User Identifier Field: ")
-        font = field_label.getFont()
-        field_label.setFont(Font(font.getFontName(), Font.BOLD, font.getSize()))
-        field_label.setAlignmentX(0.0)
-        config_panel.add(field_label)
-        config_panel.add(Box.createVerticalStrut(5))
-        
-        field_desc = JLabel("Specify which JWT claim field to use as the user identifier:")
-        field_desc.setAlignmentX(0.0)
-        config_panel.add(field_desc)
-        config_panel.add(Box.createVerticalStrut(5))
-        
-        self.field_combo = JComboBox([self.jwt_user_field, "email", "username", "sub", "id", "user_id"])
-        self.field_combo.setEditable(True)
-        self.field_combo.setMaximumSize(Dimension(300, 25))
-        self.field_combo.setAlignmentX(0.0)
-        config_panel.add(self.field_combo)
-        
-        config_panel.add(Box.createVerticalStrut(10))
-        
-        update_field_button = JButton("Update JWT Field", actionPerformed=self._on_update_jwt_field)
-        update_field_button.setMaximumSize(Dimension(300, 30))
-        update_field_button.setAlignmentX(0.0)
-        config_panel.add(update_field_button)
-        
-        config_panel.add(Box.createVerticalStrut(30))
-        
-        # Code Groups Configuration
-        groups_label = JLabel("Response Code Groups: ")
-        font = groups_label.getFont()
-        groups_label.setFont(Font(font.getFontName(), Font.BOLD, font.getSize()))
-        groups_label.setAlignmentX(0.0)
-        config_panel.add(groups_label)
-        config_panel.add(Box.createVerticalStrut(5))
-        
-        groups_desc = JLabel("Manage color-coded response code groupings:")
-        groups_desc.setAlignmentX(0.0)
-        config_panel.add(groups_desc)
-        config_panel.add(Box.createVerticalStrut(10))
-        
-        manage_groups_button = JButton("Manage Code Groups", actionPerformed=self._on_manage_code_groups)
-        manage_groups_button.setMaximumSize(Dimension(300, 30))
-        manage_groups_button.setAlignmentX(0.0)
-        config_panel.add(manage_groups_button)
-        
-        config_panel.add(Box.createVerticalStrut(30))
-        
-        # Actions section
-        actions_label = JLabel("Actions: ")
-        font = actions_label.getFont()
-        actions_label.setFont(Font(font.getFontName(), Font.BOLD, font.getSize()))
-        actions_label.setAlignmentX(0.0)
-        config_panel.add(actions_label)
-        config_panel.add(Box.createVerticalStrut(10))
-        
-        # URL filter (regex) for parsing proxy history
-        url_filter_panel = JPanel()
-        url_filter_panel.setLayout(BoxLayout(url_filter_panel, BoxLayout.X_AXIS))
-        url_filter_panel.setAlignmentX(0.0)
-        url_filter_panel.add(JLabel("URL filter (regex, optional): "))
-        self.history_url_filter_field = JTextField("", 25)
-        self.history_url_filter_field.setMaximumSize(Dimension(250, 25))
-        self.history_url_filter_field.setToolTipText(
-            "Only proxy history requests whose full URL matches this regular "
-            "expression will be included when building the matrix. Leave blank to include all requests.")
-        url_filter_panel.add(self.history_url_filter_field)
-        url_filter_panel.add(Box.createHorizontalGlue())
-        config_panel.add(url_filter_panel)
-        config_panel.add(Box.createVerticalStrut(10))
-        
-        parse_button = JButton("Parse Proxy History and Build Matrix", actionPerformed=self._on_parse_proxy_history)
-        parse_button.setMaximumSize(Dimension(500, 30))
-        parse_button.setAlignmentX(0.0)
-        config_panel.add(parse_button)
-        
-        config_panel.add(Box.createVerticalStrut(10))
-        clear_button = JButton("Clear Matrix", actionPerformed=self._on_clear_matrix)
-        clear_button.setMaximumSize(Dimension(300, 30))
-        clear_button.setAlignmentX(0.0)
-        config_panel.add(clear_button)
-        
-        config_panel.add(Box.createVerticalStrut(30))
-        
-        # Export section
-        export_label = JLabel("Export: ")
-        font = export_label.getFont()
-        export_label.setFont(Font(font.getFontName(), Font.BOLD, font.getSize()))
-        export_label.setAlignmentX(0.0)
-        config_panel.add(export_label)
-        config_panel.add(Box.createVerticalStrut(10))
-        
-        export_csv_button = JButton("Export to CSV", actionPerformed=self._on_export_csv)
-        export_csv_button.setMaximumSize(Dimension(300, 30))
-        export_csv_button.setAlignmentX(0.0)
-        config_panel.add(export_csv_button)
-        
-        config_panel.add(Box.createVerticalStrut(10))
-        
-        export_json_button = JButton("Export to JSON", actionPerformed=self._on_export_json)
-        export_json_button.setMaximumSize(Dimension(300, 30))
-        export_json_button.setAlignmentX(0.0)
-        config_panel.add(export_json_button)
-        
-        config_panel.add(Box.createVerticalStrut(30))
-        
-        # JWT Management Section
-        jwt_label = JLabel("JWT Management: ")
-        font = jwt_label.getFont()
-        jwt_label.setFont(Font(font.getFontName(), Font.BOLD, font.getSize()))
-        jwt_label.setAlignmentX(0.0)
-        config_panel.add(jwt_label)
-        config_panel.add(Box.createVerticalStrut(5))
-        
-        jwt_desc = JLabel("Track JWT tokens for each user:")
-        jwt_desc.setAlignmentX(0.0)
-        config_panel.add(jwt_desc)
-        config_panel.add(Box.createVerticalStrut(10))
-        
-        # Create JWT table
-        self.jwt_table_model = JwtTableModel()
-        jwt_table = JTable(self.jwt_table_model)
-        jwt_table.setAutoCreateRowSorter(True)
-        
-        # Set column widths
-        jwt_table.getColumnModel().getColumn(0).setPreferredWidth(100)  # User
-        jwt_table.getColumnModel().getColumn(1).setPreferredWidth(300)  # JWT
-        jwt_table.getColumnModel().getColumn(2).setPreferredWidth(150)  # Last Seen
-        
-        # Add table to scroll pane
-        jwt_scroll = JScrollPane(jwt_table)
-        jwt_scroll.setPreferredSize(Dimension(600, 200))
-        jwt_scroll.setMaximumSize(Dimension(1000, 200))
-        jwt_scroll.setAlignmentX(0.0)
-        config_panel.add(jwt_scroll)
-        
-        # Increase row height for JWT table
-        jwt_table.setRowHeight(30)  # Set default row height
-        jwt_table.getTableHeader().setPreferredSize(Dimension(jwt_table.getTableHeader().getPreferredSize().width, 25))
+        def section(title, description, *components):
+            panel.add(Box.createVerticalStrut(16))
+            for component in (bold_label(title), JLabel(description)) + components:
+                component.setAlignmentX(0.0)
+                panel.add(component)
+                panel.add(Box.createVerticalStrut(4))
 
-        # Add buttons panel
-        jwt_buttons = JPanel()
-        jwt_buttons.setLayout(BoxLayout(jwt_buttons, BoxLayout.X_AXIS))
-        jwt_buttons.setAlignmentX(0.0)
-        
-        add_jwt_button = JButton("Add Row", actionPerformed=self._on_add_jwt_row)
-        delete_jwt_button = JButton("Delete Selected", actionPerformed=lambda e: self._on_delete_jwt_row(jwt_table))
-        
-        jwt_buttons.add(add_jwt_button)
-        jwt_buttons.add(Box.createHorizontalStrut(10))
-        jwt_buttons.add(delete_jwt_button)
-        jwt_buttons.add(Box.createHorizontalGlue())
-        
-        config_panel.add(Box.createVerticalStrut(10))
-        config_panel.add(jwt_buttons)
-        
-        config_panel.add(Box.createVerticalStrut(30))
-        
-        # Replay section
-        replay_label = JLabel("Replay Settings: ")
-        font = replay_label.getFont()
-        replay_label.setFont(Font(font.getFontName(), Font.BOLD, font.getSize()))
-        replay_label.setAlignmentX(0.0)
-        config_panel.add(replay_label)
-        config_panel.add(Box.createVerticalStrut(10))
-        
-        # Thread count field
-        thread_panel = JPanel()
-        thread_panel.setLayout(BoxLayout(thread_panel, BoxLayout.X_AXIS))
-        thread_panel.setAlignmentX(0.0)
-        thread_panel.add(JLabel("Number of replay threads: "))
-        self.replay_thread_count_field = JTextField(str(self.replay_thread_count), 5)
-        self.replay_thread_count_field.setMaximumSize(Dimension(100, 25))
-        thread_panel.add(self.replay_thread_count_field)
-        thread_panel.add(Box.createHorizontalGlue())
-        config_panel.add(thread_panel)
-        config_panel.add(Box.createVerticalStrut(10))
+        def tool_box(label, name):
+            return JCheckBox(label, getattr(s, name),
+                             actionPerformed=lambda e: self._set(name, e.getSource().isSelected()))
 
-        replay_button = JButton("Replay All Requests with JWT Tokens", actionPerformed=self._replay_requests)
-        replay_button.setMaximumSize(Dimension(500, 30))
-        replay_button.setAlignmentX(0.0)
-        config_panel.add(replay_button)
+        section("Capture", "Burp tools whose traffic feeds the matrix:",
+                tool_box("Proxy", "listen_proxy"),
+                tool_box("Repeater", "listen_repeater"),
+                tool_box("Intruder", "listen_intruder"))
 
-        config_panel.add(Box.createVerticalStrut(30))
+        auth = JRadioButton("Authorization header (Bearer)", s.location == LOCATION_AUTH,
+                            actionPerformed=lambda e: self._set("location", LOCATION_AUTH))
+        cookie = JRadioButton("Cookie named:", s.location == LOCATION_COOKIE,
+                              actionPerformed=lambda e: self._set("location", LOCATION_COOKIE))
+        group = ButtonGroup()
+        group.add(auth)
+        group.add(cookie)
+        cookie_name = JTextField(s.cookie_name, 16)
+        on_text_change(cookie_name, lambda: self._set("cookie_name", cookie_name.getText()))
+        cookie_row = JPanel(FlowLayout(FlowLayout.LEFT, 0, 0))
+        cookie_row.add(cookie)
+        cookie_row.add(cookie_name)
+        section("Token location", "Where requests carry the JWT (also used when replaying):",
+                auth, cookie_row)
 
-        # Info section
-        info_label = JLabel("Information: ")
-        font = info_label.getFont()
-        info_label.setFont(Font(font.getFontName(), Font.BOLD, font.getSize()))
-        info_label.setAlignmentX(0.0)
-        config_panel.add(info_label)
-        config_panel.add(Box.createVerticalStrut(5))
-        
-        info_text = JTextArea("The matrix updates live as requests pass through:\n" +
-                          "* Proxy\n" +
-                          "* Repeater\n" +
-                          "* Intruder\n\n" +
-                          "Each cell shows HTTP response codes and their counts.\n" +
-                          "Use this to identify authorization issues and access patterns.")
-        info_text.setAlignmentX(0.0)
-        info_text.setEditable(False)
-        info_text.setOpaque(False)
-        config_panel.add(info_text)
-        
-        config_panel.add(Box.createVerticalGlue())
-        
-        # Wrap in scroll pane
-        scroll = JScrollPane(config_panel)
+        claims = JComboBox([s.user_claim] + [c for c in ("sub", "email", "username", "id", "user_id")
+                                             if c != s.user_claim])
+        claims.setEditable(True)
+        claims.setMaximumSize(Dimension(300, 28))
+        # Fires on selection, Enter and focus loss; never applied half-typed.
+        claims.addActionListener(lambda e: self._set(
+            "user_claim", unicode(claims.getSelectedItem() or "").strip() or "sub"))
+        section("User claim", "JWT claim identifying the user (dots for nested claims, e.g. "
+                "user.email). Applies to new captures; rebuild from history to re-group.",
+                claims)
+
+        section("Colours", "Status code groups colour the cells. Click a legend swatch to "
+                "change one colour.",
+                JButton("Edit code groups...", actionPerformed=lambda e: self._edit_code_groups()))
+
+        panel.add(Box.createVerticalGlue())
+        wrapper = JPanel(BorderLayout())
+        wrapper.add(panel, BorderLayout.NORTH)
+        scroll = JScrollPane(wrapper)
         scroll.setBorder(None)
         return scroll
 
-    def _create_replay_matrix_tab(self):
-        """Create a tab for displaying replay results."""
-        replay_panel = JPanel(BorderLayout())
-        
-        # Filter panel at the top
-        filter_panel = JPanel(BorderLayout())
-        filter_panel.add(JLabel("Filter endpoints: "), BorderLayout.WEST)
-        self.replay_filter_field = JTextField()
+    # --- actions
 
-        # Create custom FilterListener for replay matrix
-        class ReplayFilterListener(DocumentListener):
-            def __init__(self, extender):
-                self.extender = extender
-            
-            def insertUpdate(self, e):
-                self._apply_replay_filter()
-            
-            def removeUpdate(self, e):
-                self._apply_replay_filter()
-            
-            def changedUpdate(self, e):
-                self._apply_replay_filter()
-            
-            def _apply_replay_filter(self):
-                try:
-                    filter_text = self.extender.replay_filter_field.getText().strip()
-                    if not filter_text:
-                        # No filter, show all rows
-                        self.extender.replay_table_sorter.setRowFilter(None)
-                    else:
-                        # Create a case-insensitive regex filter for the endpoint column
-                        self.extender.replay_table_sorter.setRowFilter(
-                            RowFilter.regexFilter("(?i)" + re.escape(filter_text), 0)
-                        )
-                except Exception as e:
-                    # If regex is invalid, show all rows
-                    print("Replay filter error: %s" % str(e))
-                    self.extender.replay_table_sorter.setRowFilter(None)
-    
-        self.replay_filter_field.getDocument().addDocumentListener(ReplayFilterListener(self))
+    def _clear_matrix(self):
+        self.captured.clear()
+        self.matrix_view.refresh()
 
-        filter_panel.add(self.replay_filter_field, BorderLayout.CENTER)
-        
-        # Create table with same model as main matrix
-        self.replay_table_model = JwtMatrixModel(self)
-        self.replay_table = JTable(self.replay_table_model)
-        self.replay_table_sorter = TableRowSorter(self.replay_table_model)
-        self.replay_table.setRowSorter(self.replay_table_sorter)
-        self.replay_table.setDefaultRenderer(Object, ColorCellRenderer(self))
-        
-        # Set row height
-        self.replay_table.setRowHeight(30)
-        self.replay_table.getTableHeader().setPreferredSize(Dimension(self.replay_table.getTableHeader().getPreferredSize().width, 25))
-        
-        # Add mouse listener for cell clicks
-        class ReplayCellClickListener(MouseAdapter):
-            def __init__(self, extender):
-                self.extender = extender
-            
-            def mouseClicked(self, event):
-                table = event.getSource()
-                row = table.rowAtPoint(event.getPoint())
-                col = table.columnAtPoint(event.getPoint())
-        
-                if col == 0:
-                    # Clicked on endpoint column - toggle expansion
-                    model_row = table.convertRowIndexToModel(row)
-                    if self.extender.replay_table_model.toggle_expansion(model_row):
-                        return  # Expansion toggled, don't show details
-        
-                # Don't process clicks on endpoint column for details
-                if col > 0 and row >= 0:
-                    model_row = table.convertRowIndexToModel(row)
-                    if model_row < len(self.extender.replay_table_model.visible_rows):
-                        row_type, endpoint = self.extender.replay_table_model.visible_rows[model_row]
-                        user = self.extender.replay_table_model.users[col - 1]
-
-                        if row_type == 'base':
-                            variants = self.extender.replay_table_model.endpoint_variants.get(endpoint, [endpoint])
-                            self.extender._show_aggregated_request_details(variants, user, True)  # Pass is_replay=True
-                        else:
-                            self.extender._show_request_details(endpoint, user, True)  # Pass is_replay=True
-        
-        self.replay_table.addMouseListener(ReplayCellClickListener(self))
-        
-        scroll = JScrollPane(self.replay_table)
-        
-        # Stats label
-        self.replay_stats_label = JLabel("Endpoints: 0    Users: 0")
-        
-        # Export buttons
-        export_panel = JPanel()
-        export_panel.setLayout(BoxLayout(export_panel, BoxLayout.X_AXIS))
-        replay_export_csv_button = JButton("Export to CSV", actionPerformed=self._on_export_replay_csv)
-        replay_export_json_button = JButton("Export to JSON", actionPerformed=self._on_export_replay_json)
-        export_panel.add(replay_export_csv_button)
-        export_panel.add(Box.createHorizontalStrut(10))
-        export_panel.add(replay_export_json_button)
-        
-        # Bottom panel with stats
-        bottom_panel = JPanel(BorderLayout())
-        bottom_panel.add(self.replay_stats_label, BorderLayout.WEST)
-        bottom_panel.add(export_panel, BorderLayout.EAST)
-        
-        replay_panel.add(filter_panel, BorderLayout.NORTH)
-        replay_panel.add(scroll, BorderLayout.CENTER)
-        replay_panel.add(bottom_panel, BorderLayout.SOUTH)
-        
-        return replay_panel
-    
-    def _replay_requests(self, event):
-        """Replay all recorded requests with all JWTs using a thread pool."""
-        # Create a background thread for replay coordination
-        class ReplayCoordinatorThread(Thread):
-            def __init__(self, extender):
-                Thread.__init__(self)
-                self.extender = extender
-                self.cancelled = False
-                self.executor = None
-            
-            def run(self):
-                try:
-                    # Get thread count from UI and validate
-                    try:
-                        thread_count = int(self.extender.replay_thread_count_field.getText().strip())
-                        if thread_count < 1:
-                            thread_count = 1
-                        elif thread_count > 50:
-                            thread_count = 50
-                        self.extender.replay_thread_count = thread_count
-                    except:
-                        thread_count = self.extender.replay_thread_count
-                    
-                    # Create new data structures for replay results
-                    self.extender.replay_matrix = defaultdict(lambda: defaultdict(lambda: defaultdict(int)))
-                    self.extender.replay_request_details = defaultdict(lambda: defaultdict(lambda: defaultdict(list)))
-                    self.extender.replay_endpoints_order = []
-                    self.extender.replay_users_order = []
-                    
-                    # Get all unique requests and tokens
-                    unique_requests = set()
-                    for endpoint in self.extender.request_details:
-                        for user in self.extender.request_details[endpoint]:
-                            for code in self.extender.request_details[endpoint][user]:
-                                for req in self.extender.request_details[endpoint][user][code]:
-                                    unique_requests.add(req)
-                    
-                    jwt_tokens = {}  # user -> token
-                    for row in range(self.extender.jwt_table_model.getRowCount()):
-                        user = self.extender.jwt_table_model.getValueAt(row, 0)
-                        token = self.extender.jwt_table_model.getValueAt(row, 1)
-                        if user and token:
-                            jwt_tokens[user] = token
-                            # Add user to replay_users_order immediately
-                            if user not in self.extender.replay_users_order:
-                                self.extender.replay_users_order.append(user)
-                    
-                    if not jwt_tokens:
-                        print("No JWT tokens found in JWT Management table")
-                        return
-                    
-                    # Calculate total requests
-                    total_requests = len(unique_requests) * len(jwt_tokens)
-                    
-                    # Create progress dialog on EDT
-                    dialog_ref = [None]
-                    progress_ref = [None]
-                    cancel_button_ref = [None]
-                    SwingUtilities.invokeAndWait(lambda: self._create_progress_dialog(dialog_ref, progress_ref, cancel_button_ref, total_requests))
-                    dialog = dialog_ref[0]
-                    progress = progress_ref[0]
-                    
-                    # Create atomic counter for thread-safe progress updates
-                    progress_counter = AtomicInteger(0)
-                    
-                    # Create lock for thread-safe replay matrix updates
-                    replay_lock = ReentrantLock()
-                    
-                    # Store reference to cancel button listener
-                    coordinator_ref = [self]
-                    
-                    def on_cancel_click(event):
-                        """Handle cancel button click"""
-                        coordinator_ref[0].cancelled = True
-                        if coordinator_ref[0].executor:
-                            coordinator_ref[0].executor.shutdownNow()
-                        dialog.dispose()
-                        print("Replay cancelled by user")
-                    
-                    cancel_button_ref[0].addActionListener(lambda e: on_cancel_click(e))
-                    
-                    try:
-                        # Create thread pool
-                        self.executor = Executors.newFixedThreadPool(thread_count)
-                        
-                        # Create tasks for each (request, user, token) combination
-                        tasks = []
-                        for req in unique_requests:
-                            if self.cancelled:
-                                break
-                            try:
-                                analyzed_req = self.extender._helpers.analyzeRequest(req)
-                                headers = analyzed_req.getHeaders()
-                                url = analyzed_req.getUrl()
-                                method = headers[0].split(' ')[0] if headers and len(headers)>0 else "GET"
-                                endpoint = "%s %s" % (method, url.getPath() + (("?" + url.getQuery()) if url.getQuery() else ""))
-                                
-                                # Add endpoint to replay_endpoints_order
-                                if endpoint not in self.extender.replay_endpoints_order:
-                                    self.extender.replay_endpoints_order.append(endpoint)
-                                
-                                # Create task for each user/token combination
-                                for user, token in jwt_tokens.items():
-                                    if self.cancelled:
-                                        break
-                                    task = ReplayTaskCallable(
-                                        self.extender,
-                                        req,
-                                        endpoint,
-                                        user,
-                                        token,
-                                        headers,
-                                        analyzed_req,
-                                        progress,
-                                        progress_counter,
-                                        total_requests,
-                                        replay_lock
-                                    )
-                                    tasks.append(self.executor.submit(task))
-                            
-                            except Exception as e:
-                                print("Error preparing replay task: %s" % str(e))
-                        
-                        # Wait for all tasks to complete or cancellation
-                        self.executor.shutdown()
-                        self.executor.awaitTermination(300, TimeUnit.SECONDS)  # Wait up to 5 minutes
-                        
-                    finally:
-                        # Close progress dialog on EDT only if not already disposed
-                        def close_dialog():
-                            try:
-                                dialog.dispose()
-                            except:
-                                pass
-                        SwingUtilities.invokeLater(close_dialog)
-                    
-                    # Only update replay matrix tab if not cancelled
-                    if not self.cancelled:
-                        # Update replay matrix tab and switch to it
-                        SwingUtilities.invokeLater(lambda: self.extender._update_replay_table_model())
-                        SwingUtilities.invokeLater(lambda: self.extender.tabbed_pane.setSelectedIndex(2))
-                        print("Replay completed with %d threads" % thread_count)
-                    else:
-                        print("Replay was cancelled")
-                
-                except Exception as e:
-                    print("Error during replay: %s" % str(e))
-
-            def _create_progress_dialog(self, dialog_ref, progress_ref, cancel_button_ref, total_requests):
-                """Create progress dialog with cancel button (called on EDT)"""
-                dialog = JFrame("Replaying Requests...")
-                dialog.setDefaultCloseOperation(WindowConstants.DO_NOTHING_ON_CLOSE)
-
-                # Create panel for progress bar and button
-                panel = JPanel(BorderLayout())
-                
-                progress = JProgressBar(0, total_requests)
-                progress.setStringPainted(True)
-                panel.add(progress, BorderLayout.CENTER)
-                
-                # Create button panel
-                button_panel = JPanel()
-                button_panel.setLayout(BoxLayout(button_panel, BoxLayout.X_AXIS))
-                button_panel.add(Box.createHorizontalGlue())
-                
-                cancel_button = JButton("Cancel")
-                button_panel.add(cancel_button)
-                button_panel.add(Box.createHorizontalStrut(10))
-                
-                panel.add(button_panel, BorderLayout.SOUTH)
-                
-                dialog.add(panel)
-                dialog.setSize(400, 120)
-                dialog.setLocationRelativeTo(None)
-                dialog.setVisible(True)
-
-                dialog_ref[0] = dialog
-                progress_ref[0] = progress
-                cancel_button_ref[0] = cancel_button
-
-            def _update_progress(self, progress, counter, total):
-                """Update progress bar (called on EDT)"""
-                current = counter.get()
-                progress.setValue(current)
-                progress.setString(str(current) + '/' + str(total) + ' (' + str(int((current*100)/total)) + '%)')
-        
-        ReplayCoordinatorThread(self).start()
-
-    def _update_replay_progress(self, progress, current, total):
-        """Update progress bar (called on EDT)"""
-        progress.setValue(current)
-        progress.setString(str(current) + '/' + str(total) + ' (' + str(int((current*100)/total)) + '%)')
-
-    def _update_table_model(self):
-        # prepare ordered lists to preserve stable columns/rows
-        # Group endpoints by base path (without query parameters)
-        endpoint_groups = defaultdict(list)  # base_endpoint -> list of full endpoints
-        
-        for full_endpoint in self.endpoints_order:
-            # Extract base endpoint (method + path without query params)
-            if '?' in full_endpoint:
-                base_endpoint = full_endpoint.split('?')[0]
-            else:
-                base_endpoint = full_endpoint
-            endpoint_groups[base_endpoint].append(full_endpoint)
-        
-        # Create ordered list of base endpoints
-        base_endpoints = []
-        seen = set()
-        for full_endpoint in self.endpoints_order:
-            if '?' in full_endpoint:
-                base = full_endpoint.split('?')[0]
-            else:
-                base = full_endpoint
-            if base not in seen:
-                base_endpoints.append(base)
-                seen.add(base)
-        
-        users = list(self.users_order)
-        
-        # Convert nested defaultdict to plain dict for model
-        data = defaultdict(lambda: defaultdict(dict))
-        for ep in self.endpoints_order:
-            for u in users:
-                data[ep][u] = dict(self.matrix.get(ep, {}).get(u, {}))
-        
-        self.table_model.set_matrix(base_endpoints, endpoint_groups, users, data)
-        self.stats_label.setText("Endpoints: %d (Base: %d)    Users: %d" % 
-                                (len(self.endpoints_order), len(base_endpoints), len(users)))
-        # Re-apply filter after model update
-        self._apply_filter()
-
-    def _update_replay_table_model(self):
-        """Update the replay matrix table model."""
-        # Group endpoints by base path
-        endpoint_groups = defaultdict(list)
-        for full_endpoint in self.replay_endpoints_order:
-            if '?' in full_endpoint:
-                base_endpoint = full_endpoint.split('?')[0]
-            else:
-                base_endpoint = full_endpoint
-            endpoint_groups[base_endpoint].append(full_endpoint)
-        
-        # Create ordered list of base endpoints
-        base_endpoints = []
-        seen = set()
-        for full_endpoint in self.replay_endpoints_order:
-            if '?' in full_endpoint:
-                base = full_endpoint.split('?')[0]
-            else:
-                base = full_endpoint
-            if base not in seen:
-                base_endpoints.append(base)
-                seen.add(base)
-        
-        users = list(self.replay_users_order)
-        
-        # Convert nested defaultdict to plain dict for model
-        data = defaultdict(lambda: defaultdict(dict))
-        for ep in self.replay_endpoints_order:
-            for u in users:
-                data[ep][u] = dict(self.replay_matrix.get(ep, {}).get(u, {}))
-        
-        self.replay_table_model.set_matrix(base_endpoints, endpoint_groups, users, data)
-        self.replay_stats_label.setText(
-            "Endpoints: %d (Base: %d)    Users: %d" % 
-            (len(self.replay_endpoints_order), len(base_endpoints), len(users))
-        )
-        # Re-apply filter after model update
+    def _on_import_history(self, event):
+        pattern = self._history_filter.getText().strip()
         try:
-            filter_text = self.replay_filter_field.getText().strip()
-            if not filter_text:
-                self.replay_table_sorter.setRowFilter(None)
-            else:
-                self.replay_table_sorter.setRowFilter(
-                    RowFilter.regexFilter("(?i)" + re.escape(filter_text), 0)
-                )
-        except Exception as e:
-            print("Replay filter error: %s" % str(e))
-            self.replay_table_sorter.setRowFilter(None)
+            url_filter = re.compile(pattern) if pattern else None
+        except re.error as e:
+            JOptionPane.showMessageDialog(self._panel, "Invalid URL regex: %s" % e,
+                                          EXTENSION_NAME, JOptionPane.ERROR_MESSAGE)
+            return
+        self._import_button.setEnabled(False)
+        self.import_history(url_filter, on_done=lambda: self._import_button.setEnabled(True))
 
-    def _apply_filter(self):
-        """Apply the filter to the table based on the filter text field."""
-        try:
-            filter_text = self.filter_field.getText().strip()
-            if not filter_text:
-                # No filter, show all rows
-                self.table_sorter.setRowFilter(None)
-            else:
-                # Create a case-insensitive regex filter for the endpoint column (column 0)
-                self.table_sorter.setRowFilter(javax.swing.RowFilter.regexFilter("(?i)" + re.escape(filter_text), 0))
-        except Exception as e:
-            # If regex is invalid, show all rows
-            print("Filter error: %s" % str(e))
-            self.table_sorter.setRowFilter(None)
+    def _start_replay(self):
+        tokens = self.tokens.tokens()
+        messages = self.captured.all_messages()
+        if not tokens or not messages:
+            JOptionPane.showMessageDialog(self._panel, "Replay needs captured requests and at "
+                                          "least one user with a token.", EXTENSION_NAME,
+                                          JOptionPane.INFORMATION_MESSAGE)
+            return
 
-    def _update_listening_preferences(self):
-        """Update listening preferences from checkboxes."""
-        try:
-            self.listen_proxy = self.proxy_checkbox.isSelected()
-            self.listen_repeater = self.repeater_checkbox.isSelected()
-            self.listen_intruder = self.intruder_checkbox.isSelected()
-        except:
-            pass
+        window = JFrame("Replaying requests...")
+        window.setDefaultCloseOperation(WindowConstants.DO_NOTHING_ON_CLOSE)
 
-    def _on_update_jwt_field(self, event=None):
-        """Update the JWT field from the combo box."""
-        try:
-            chosen = self.field_combo.getEditor().getItem().strip()
-            if chosen:
-                old_field = self.jwt_user_field
-                self.jwt_user_field = chosen
-                print("JWT field updated from '%s' to '%s'" % (old_field, chosen))
-                print("Note: This will apply to new requests. To rebuild the matrix with the new field, click 'Parse Proxy History'.")
-        except Exception as e:
-            print("Error updating JWT field: %s" % str(e))
+        def on_progress(done, total):
+            progress.setValue(done)
+            progress.setString("%d / %d" % (done, total))
+            self.replay_view.schedule_refresh()
 
-    def _on_manage_code_groups(self, event=None):
-        """Open dialog to manage response code groups and their colors."""
-        try:
-            dialog = JDialog(JFrame(), "Manage Response Code Groups", True)
-            dialog.setSize(600, 400)
-            dialog.setLocationRelativeTo(self._panel)
-            dialog.setDefaultCloseOperation(WindowConstants.DISPOSE_ON_CLOSE)
-            
-            # Main panel
-            main_panel = JPanel(BorderLayout())
-            main_panel.add(JLabel("Configure response code groups and their colors (one pattern per line):"), BorderLayout.NORTH)
-            
-            # Text area for editing groups
-            text_area = JTextArea()
-            text_area.setLineWrap(True)
-            text_area.setWrapStyleWord(True)
-            # Build text from current groups
-            lines = []
-            for pattern, (color, label) in self.code_color_groups.items():
-                r = color.getRed()
-                g = color.getGreen()
-                b = color.getBlue()
-                hex_color = "%02x%02x%02x" % (r, g, b)
-                lines.append("%s:0x%s:%s" % (pattern, hex_color, label))
-            text_area.setText("\n".join(lines))
-            
-            scroll = JScrollPane(text_area)
-            main_panel.add(scroll, BorderLayout.CENTER)
-            
-            # Format help
-            help_label = JLabel("Format: pattern:0xHEXCOLOR:label (e.g., 2xx:0x387723:Success)")
-            help_label.setFont(Font(help_label.getFont().getFontName(), Font.ITALIC, 10))
-            help_panel = JPanel(BorderLayout())
-            help_panel.add(help_label, BorderLayout.WEST)
-            main_panel.add(help_panel, BorderLayout.SOUTH)
-            
-            # Button panel
-            button_panel = JPanel()
-            button_panel.setLayout(BoxLayout(button_panel, BoxLayout.X_AXIS))
-            
-            def apply_changes():
-                try:
-                    new_groups = OrderedDict()
-                    for line in text_area.getText().split('\n'):
-                        line = line.strip()
-                        if not line:
-                            continue
-                        parts = line.split(':')
-                        if len(parts) >= 3:
-                            pattern = parts[0].strip()
-                            hex_color = parts[1].strip()
-                            label = ':'.join(parts[2:]).strip()
-                            
-                            # Parse hex color
-                            if hex_color.startswith('0x'):
-                                hex_color = hex_color[2:]
-                            try:
-                                color_int = int(hex_color, 16)
-                                r = (color_int >> 16) & 0xFF
-                                g = (color_int >> 8) & 0xFF
-                                b = color_int & 0xFF
-                                new_groups[pattern] = (Color(r, g, b), label)
-                            except ValueError:
-                                print("Invalid color format: %s" % hex_color)
-                                continue
-                    
-                    if new_groups:
-                        self.code_color_groups = new_groups
-                        # Rebuild the legend to show new groups
-                        self._rebuild_legend()
-                        self.table.repaint()
-                        print("Code groups updated")
-                        dialog.dispose()
-                except Exception as e:
-                    print("Error applying code groups: %s" % str(e))
-            
-            apply_button = JButton("Apply", actionPerformed=lambda e: apply_changes())
-            cancel_button = JButton("Cancel", actionPerformed=lambda e: dialog.dispose())
-            
-            button_panel.add(Box.createHorizontalGlue())
-            button_panel.add(apply_button)
-            button_panel.add(Box.createHorizontalStrut(10))
-            button_panel.add(cancel_button)
-            
-            main_panel.add(button_panel, BorderLayout.PAGE_END)
-            
-            dialog.setContentPane(main_panel)
-            dialog.setVisible(True)
-        except Exception as e:
-            print("Error opening manage code groups dialog: %s" % str(e))
+        def on_finished(cancelled):
+            window.dispose()
+            self._replay_job = None
+            self._replay_button.setEnabled(True)
+            self.replay_view.refresh()
+            log("Replay %s." % ("cancelled" if cancelled else "finished"))
 
-    def _matches_code_pattern(self, code, pattern):
-        """Check if a response code matches a pattern (e.g., 200 matches 2xx)."""
-        # This method now only checks if a single code matches a single pattern part
-        # For comma-separated patterns, use _matches_code_group_pattern instead
-        if pattern == code:
-            return True
-        # Pattern matching for xx (e.g., 2xx, 4xx)
-        if len(pattern) == 3 and pattern.endswith('xx'):
-            return code.startswith(pattern[0])
-        return False
-    
-    def _matches_code_group_pattern(self, codes, pattern):
-        """Check if a list of codes matches a group pattern (including comma-separated)."""
-        # Handle comma-separated patterns (e.g., "2xx,5xx")
-        if ',' in pattern:
-            # For comma-separated patterns, we need at least one code matching EACH part
-            parts = [p.strip() for p in pattern.split(',')]
-            for part in parts:
-                # Check if at least one code matches this part
-                if not any(self._matches_code_pattern(code, part) for code in codes):
-                    return False
-            # All parts have at least one matching code
-            return True
+        self.replayed.clear()
+        job = self._replay_job = ReplayJob(
+            self._callbacks, self.replayed, messages, tokens, self.settings.location,
+            self.settings.effective_cookie_name(), self.settings.replay_threads,
+            on_progress, on_finished)
+        progress = JProgressBar(0, job.total)
+        progress.setStringPainted(True)
+
+        cancel_row = JPanel(FlowLayout(FlowLayout.RIGHT))
+        cancel_row.add(JButton("Cancel", actionPerformed=lambda e: job.cancel()))
+        window.add(progress, BorderLayout.CENTER)
+        window.add(cancel_row, BorderLayout.SOUTH)
+        window.setSize(420, 110)
+        window.setLocationRelativeTo(self._panel)
+        window.setVisible(True)
+
+        self._replay_button.setEnabled(False)
+        self._tabs.setSelectedIndex(1)
+        job.start()
+
+    def choose_color(self, group_index):
+        """Recolour a code group, or the empty-cell colour when group_index is None."""
+        s = self.settings
+        if group_index is None:
+            chosen = JColorChooser.showDialog(self._panel, "Colour for empty cells",
+                                              Color(s.no_requests_color))
+            if chosen is not None:
+                s.no_requests_color = chosen.getRGB() & 0xFFFFFF
         else:
-            # For single patterns, all codes must match
-            return all(self._matches_code_pattern(code, pattern) for code in codes)
+            pattern, rgb, label = s.code_groups[group_index]
+            chosen = JColorChooser.showDialog(self._panel, "Colour for %s" % label, Color(rgb))
+            if chosen is not None:
+                s.code_groups[group_index] = (pattern, chosen.getRGB() & 0xFFFFFF, label)
+        if chosen is not None:
+            self._colors_changed()
 
-    def _on_color_change(self, color_type):
-        """Open color picker to change a color scheme."""
-        try:
-            # Get current color
-            current_color = None
-            title = ""
-            
-            if color_type == "no_requests":
-                current_color = self.color_no_requests_group[0]
-                title = "Choose color for no requests"
-            elif color_type in self.code_color_groups:
-                current_color, label = self.code_color_groups[color_type]
-                title = "Choose color for %s" % label
-            else:
+    def _edit_code_groups(self):
+        text = JTextArea(format_code_groups(self.settings.code_groups), 12, 40)
+        panel = JPanel(BorderLayout(0, 6))
+        panel.add(JLabel("One group per line: pattern:0xRRGGBB:label  (e.g. 2xx,5xx:0x9933cc:Mixed)"),
+                  BorderLayout.NORTH)
+        panel.add(JScrollPane(text), BorderLayout.CENTER)
+        while JOptionPane.showConfirmDialog(self._panel, panel, "Response code groups",
+                                            JOptionPane.OK_CANCEL_OPTION,
+                                            JOptionPane.PLAIN_MESSAGE) == JOptionPane.OK_OPTION:
+            groups, errors = parse_code_groups(text.getText())
+            if not errors and groups:
+                self.settings.code_groups = groups
+                self._colors_changed()
                 return
-            
-            # Show color chooser
-            new_color = JColorChooser.showDialog(self._panel, title, current_color)
-            
-            if new_color is not None:
-                # Update the color
-                if color_type == "no_requests":
-                    old_label = self.color_no_requests_group[1]
-                    self.color_no_requests_group = (new_color, old_label)
-                elif color_type in self.code_color_groups:
-                    old_label = self.code_color_groups[color_type][1]
-                    self.code_color_groups[color_type] = (new_color, old_label)
-                
-                # Refresh the table and legend to apply new colors
-                self._rebuild_legend()
-                self.table.repaint()
-                
-                print("Color updated for %s" % color_type)
-        except Exception as e:
-            print("Error changing color: %s" % str(e))
+            JOptionPane.showMessageDialog(
+                self._panel, "\n".join(errors) or "Define at least one group.",
+                "Invalid code groups", JOptionPane.ERROR_MESSAGE)
 
-    def _rebuild_matrix_tab(self):
-        """Rebuild the matrix tab to reflect new colors in the legend."""
+    def _colors_changed(self):
+        self.settings.save()
+        self.matrix_view.rebuild_legend()
+        self.replay_view.rebuild_legend()
+
+    def save_file(self, title, extension, content):
+        chooser = JFileChooser()
+        chooser.setDialogTitle(title)
+        chooser.setFileFilter(FileNameExtensionFilter(extension.upper() + " files", [extension]))
+        if chooser.showSaveDialog(self._panel) != JFileChooser.APPROVE_OPTION:
+            return
+        path = chooser.getSelectedFile().getAbsolutePath()
+        if not path.lower().endswith("." + extension):
+            path += "." + extension
         try:
-            # Get the current matrix tab
-            matrix_tab = self._create_matrix_tab()
-            self.tabbed_pane.setComponentAt(0, matrix_tab)
-        except Exception as e:
-            print("Error rebuilding matrix tab: %s" % str(e))
+            with open(path, "wb") as out:
+                out.write(content.encode("utf-8") if isinstance(content, unicode) else content)
+            log("Saved %s" % path)
+        except IOError as e:
+            JOptionPane.showMessageDialog(self._panel, "Could not save %s: %s" % (path, e),
+                                          EXTENSION_NAME, JOptionPane.ERROR_MESSAGE)
 
-    def _show_request_details(self, endpoint, user, is_replay=False):
-        """Show details for requests at a specific endpoint/user combination."""
-        # Select correct data structure based on is_replay flag
-        request_data = self.replay_request_details if is_replay else self.request_details
-        
-        dialog = JFrame('Replay ' if is_replay else '' + 'Requests for %s - User: %s' % (endpoint, user))
-        dialog.setSize(800, 600)
-        
-        # Create main split pane
-        mainSplitPane = JSplitPane(JSplitPane.VERTICAL_SPLIT)
-        mainSplitPane.setResizeWeight(0.3) # Give 30% to top component
-        
-        # Create request list panel
-        requests = []
-        for code in request_data[endpoint][user]:
-            valid_requests = [r for r in request_data[endpoint][user][code] 
-                         if r and r.getResponse() is not None]
-            requests.extend(valid_requests)
-        
-         # Create table model for requests with null checks
-        request_table = JTable(DefaultTableModel(
-            [[str(i+1), r.getHttpService().getHost(), 
-              self._helpers.analyzeResponse(r.getResponse()).getStatusCode() if r.getResponse() else "N/A"] 
-             for i,r in enumerate(requests)],
-            ["#", "Host", "Status"]))
-        
-        request_table.setSelectionMode(ListSelectionModel.SINGLE_SELECTION)
-        list_scroll = JScrollPane(request_table)
-        
-        # Create request/response viewers
-        controller = RequestDetailsController(self, requests)
-        req_viewer = self._callbacks.createMessageEditor(controller, False)
-        resp_viewer = self._callbacks.createMessageEditor(controller, False)
-        
-        # Create viewer split pane
-        viewerSplitPane = JSplitPane(JSplitPane.HORIZONTAL_SPLIT)
-        viewerSplitPane.setResizeWeight(0.5) # Equal split
-        viewerSplitPane.setLeftComponent(req_viewer.getComponent())
-        viewerSplitPane.setRightComponent(resp_viewer.getComponent())
-        
-        # Add components to main split pane
-        mainSplitPane.setTopComponent(list_scroll)
-        mainSplitPane.setBottomComponent(viewerSplitPane)
-        
-        # Add selection listener
-        def selection_changed(event):
-            if not event.getValueIsAdjusting():
-                row = request_table.getSelectedRow()
-                if row >= 0:
-                    req_viewer.setMessage(requests[row].getRequest(), True)
-                    resp_viewer.setMessage(requests[row].getResponse(), False)
-        
-        request_table.getSelectionModel().addListSelectionListener(selection_changed)
-        
-        # Select first row by default
-        if len(requests) > 0:
-            request_table.setRowSelectionInterval(0, 0)
-        
-        # Add to dialog with proper layout
-        dialog.add(mainSplitPane)
-        dialog.setDefaultCloseOperation(JFrame.DISPOSE_ON_CLOSE)
-        dialog.setVisible(True)
+    def show_messages(self, title, messages):
+        """Open a window listing messages, with Burp's request/response viewers."""
+        rows = []
+        for number, msg in enumerate(messages, 1):
+            info = self._helpers.analyzeRequest(msg)
+            status = self._helpers.analyzeResponse(msg.getResponse()).getStatusCode()
+            rows.append([number, info.getMethod(), url_text(info.getUrl()), status])
+        table = JTable(ReadOnlyTableModel(rows, ["#", "Method", "URL", "Status"]))
+        table.setSelectionMode(ListSelectionModel.SINGLE_SELECTION)
+        table.getColumnModel().getColumn(2).setPreferredWidth(500)
 
-    def _show_aggregated_request_details(self, endpoint_variants, user, is_replay=False):
-        """Show details for requests across multiple endpoint variants for a user."""
-        # Select correct data structure based on is_replay flag
-        request_data = self.replay_request_details if is_replay else self.request_details
-        
-        dialog = JFrame('Replay ' if is_replay else '' + "Requests for %d endpoints - User: %s" % (len(endpoint_variants), user))
-        dialog.setSize(800, 600)
-        
-        # Create main split pane
-        mainSplitPane = JSplitPane(JSplitPane.VERTICAL_SPLIT)
-        mainSplitPane.setResizeWeight(0.3)
-        
-        # Collect all requests
-        all_requests = []
-        for endpoint in endpoint_variants:
-            for code in request_data[endpoint][user]:
-                valid_requests = [r for r in request_data[endpoint][user][code] 
-                            if r and r.getResponse() is not None]
-                all_requests.extend(valid_requests)
-        
-        # Create table model with null checks
-        request_table = JTable(DefaultTableModel(
-            [[str(i+1), r.getHttpService().getHost(),
-              self._helpers.analyzeRequest(r).getUrl().getPath(),
-              self._helpers.analyzeResponse(r.getResponse()).getStatusCode() if r.getResponse() else "N/A"]
-             for i,r in enumerate(all_requests)],
-            ["#", "Host", "Path", "Status"]))
-        
-        request_table.setSelectionMode(ListSelectionModel.SINGLE_SELECTION)
-        list_scroll = JScrollPane(request_table)
-        
-        # Create request/response viewers
-        controller = RequestDetailsController(self, all_requests)
-        req_viewer = self._callbacks.createMessageEditor(controller, False)
-        resp_viewer = self._callbacks.createMessageEditor(controller, False)
-        
-        # Create viewer split pane
-        viewerSplitPane = JSplitPane(JSplitPane.HORIZONTAL_SPLIT)
-        viewerSplitPane.setResizeWeight(0.5)
-        viewerSplitPane.setLeftComponent(req_viewer.getComponent())
-        viewerSplitPane.setRightComponent(resp_viewer.getComponent())
-        
-        # Add components to main split pane
-        mainSplitPane.setTopComponent(list_scroll)
-        mainSplitPane.setBottomComponent(viewerSplitPane)
-        
-        # Add selection listener
-        def selection_changed(event):
-            if not event.getValueIsAdjusting():
-                row = request_table.getSelectedRow()
-                if row >= 0:
-                    req_viewer.setMessage(all_requests[row].getRequest(), True)
-                    resp_viewer.setMessage(all_requests[row].getResponse(), False)
-        
-        request_table.getSelectionModel().addListSelectionListener(selection_changed)
-        
-        # Select first row by default
-        if len(all_requests) > 0:
-            request_table.setRowSelectionInterval(0, 0)
-        
-        # Add to dialog with proper layout
-        dialog.add(mainSplitPane)
-        dialog.setDefaultCloseOperation(JFrame.DISPOSE_ON_CLOSE)
-        dialog.setVisible(True)
+        controller = _MessageController()
+        request_viewer = self._callbacks.createMessageEditor(controller, False)
+        response_viewer = self._callbacks.createMessageEditor(controller, False)
 
-    def _on_clear_matrix(self, event=None):
-        # reset data structures
-        self.matrix = defaultdict(lambda: defaultdict(lambda: defaultdict(int)))
-        self.request_details = defaultdict(lambda: defaultdict(lambda: defaultdict(list)))
-        self.endpoints_order = []
-        self.users_order = []
-        SwingUtilities.invokeLater(lambda: self._update_table_model())
-
-    def _on_parse_proxy_history(self, event=None):
-        # Update listening preferences from checkboxes
-        self._update_listening_preferences()
-        
-        # get configured field
-        try:
-            chosen = self.field_combo.getEditor().getItem().strip()
-            if chosen:
-                self.jwt_user_field = chosen
-        except:
-            pass
-        # fetch proxy history and process each request
-        try:
-            history = self._callbacks.getProxyHistory()
-            # reset matrix first
-            self.matrix = defaultdict(lambda: defaultdict(lambda: defaultdict(int)))
-            self.request_details = defaultdict(lambda: defaultdict(lambda: defaultdict(list)))
-            self.endpoints_order = []
-            self.users_order = []
-            # Compile optional URL regex filter
-            url_filter_pattern = None
-            try:
-                url_filter_text = self.history_url_filter_field.getText().strip()
-                if url_filter_text:
-                    url_filter_pattern = re.compile(url_filter_text)
-            except Exception as filter_err:
-                print("Invalid URL filter regex, ignoring filter: %s" % str(filter_err))
-                url_filter_pattern = None
-            for item in history:
-                try:
-                    # Get request info
-                    analyzed_req = self._helpers.analyzeRequest(item)
-                    headers = analyzed_req.getHeaders()
-                    url = analyzed_req.getUrl()
-                    method = headers[0].split(' ')[0] if headers and len(headers)>0 else "GET"
-                    endpoint = "%s %s" % (method, url.getPath() + (("?" + url.getQuery()) if url.getQuery() else ""))
-                    
-                    # Skip requests that don't match the configured URL filter
-                    if url_filter_pattern is not None:
-                        if not url_filter_pattern.search(str(url)):
-                            continue
-                    
-                    # Get response code
-                    response = item.getResponse()
-                    if response is None:
-                        continue
-                    analyzed_resp = self._helpers.analyzeResponse(response)
-                    response_code = str(analyzed_resp.getStatusCode())
-
-                    # Find JWT token based on configured location
-                    token = None
-                    if self.jwt_location_auth.isSelected():
-                        # Look in Authorization header
-                        for h in headers:
-                            if h.lower().startswith("authorization:"):
-                                parts = h.split(":",1)[1].strip().split()
-                                if len(parts) >= 2 and parts[0].lower() == "bearer":
-                                    token = parts[1].strip()
-                                    break
-                    else:
-                        # Look in Cookies
-                        cookie_name = self.cookie_name_field.getText().strip() or "jwt"
-                        for h in headers:
-                            if h.lower().startswith("cookie:"):
-                                cookies = h.split(":",1)[1].strip().split(";")
-                                for cookie in cookies:
-                                    if "=" in cookie:
-                                        name, value = cookie.split("=", 1)
-                                        if name.strip() == cookie_name:
-                                            token = value.strip()
-                                            break
-                                if token:
-                                    break
-                
-                    if not token:
-                        continue
-
-                    user = self._parse_jwt_get_field(token, self.jwt_user_field)
-                    if user is None:
-                        user = "<no-%s>" % self.jwt_user_field
-                    if endpoint not in self.endpoints_order:
-                        self.endpoints_order.append(endpoint)
-                    if user not in self.users_order:
-                        self.users_order.append(user)
-                    self.matrix[endpoint][user][response_code] += 1
-                    
-                    # Store the IHttpRequestResponse object
-                    self.request_details[endpoint][user][response_code].append(item)
-                except Exception:
-                    # skip single items on error
-                    continue
-            # finally update UI
-            SwingUtilities.invokeLater(lambda: self._update_table_model())
-        except Exception as e:
-            print("Error parsing proxy history: %s" % str(e))
-
-    def _on_export_csv(self, event=None):
-        """Export the matrix to CSV format."""
-        try:
-            # Show file chooser
-            chooser = JFileChooser()
-            chooser.setDialogTitle("Save Matrix as CSV")
-            chooser.setFileFilter(FileNameExtensionFilter("CSV files", ["csv"]))
-            result = chooser.showSaveDialog(self._panel)
-            
-            if result == JFileChooser.APPROVE_OPTION:
-                file_path = chooser.getSelectedFile().getAbsolutePath()
-                if not file_path.endswith('.csv'):
-                    file_path += '.csv'
-                
-                # Build CSV content
-                csv_lines = []
-                
-                # Header row
-                header = ["Endpoint"] + list(self.users_order)
-                csv_lines.append(",".join(['"%s"' % h.replace('"', '""') for h in header]))
-                
-                # Data rows
-                for endpoint in self.endpoints_order:
-                    row = ['"%s"' % endpoint.replace('"', '""')]
-                    for user in self.users_order:
-                        code_dict = self.matrix.get(endpoint, {}).get(user, {})
-                        if code_dict:
-                            cell_value = ", ".join(["%s: %d" % (code, count) for code, count in sorted(code_dict.items())])
-                        else:
-                            cell_value = "0"
-                        row.append('"%s"' % cell_value.replace('"', '""'))
-                    csv_lines.append(",".join(row))
-                
-                # Write to file
-                with open(file_path, 'w') as f:
-                    f.write("\n".join(csv_lines))
-                
-                print("Matrix exported to CSV: %s" % file_path)
-        except Exception as e:
-            print("Error exporting to CSV: %s" % str(e))
-
-    def _on_export_json(self, event=None):
-        """Export the matrix to JSON format."""
-        try:
-            # Show file chooser
-            chooser = JFileChooser()
-            chooser.setDialogTitle("Save Matrix as JSON")
-            chooser.setFileFilter(FileNameExtensionFilter("JSON files", ["json"]))
-            result = chooser.showSaveDialog(self._panel)
-            
-            if result == JFileChooser.APPROVE_OPTION:
-                file_path = chooser.getSelectedFile().getAbsolutePath()
-                if not file_path.endswith('.json'):
-                    file_path += '.json'
-                
-                # Build JSON structure
-                export_data = {
-                    "jwt_field": self.jwt_user_field,
-                    "users": list(self.users_order),
-                    "endpoints": []
-                }
-                
-                for endpoint in self.endpoints_order:
-                    endpoint_data = {
-                        "endpoint": endpoint,
-                        "users": {}
-                    }
-                    for user in self.users_order:
-                        code_dict = self.matrix.get(endpoint, {}).get(user, {})
-                        if code_dict:
-                            endpoint_data["users"][user] = dict(code_dict)
-                        else:
-                            endpoint_data["users"][user] = {}
-                    export_data["endpoints"].append(endpoint_data)
-                
-                # Write to file
-                with open(file_path, 'w') as f:
-                    json.dump(export_data, f, indent=2)
-                
-                print("Matrix exported to JSON: %s" % file_path)
-        except Exception as e:
-            print("Error exporting to JSON: %s" % str(e))
-
-    def _on_export_replay_csv(self, event=None):
-        """Export the replay matrix to CSV format."""
-        try:
-            if not self.replay_endpoints_order:
-                print("Nothing to export: run a replay first.")
+        def on_select(event):
+            row = table.getSelectedRow()
+            if event.getValueIsAdjusting() or row < 0:
                 return
-            # Show file chooser
-            chooser = JFileChooser()
-            chooser.setDialogTitle("Save Replay Matrix as CSV")
-            chooser.setFileFilter(FileNameExtensionFilter("CSV files", ["csv"]))
-            result = chooser.showSaveDialog(self._panel)
-            
-            if result == JFileChooser.APPROVE_OPTION:
-                file_path = chooser.getSelectedFile().getAbsolutePath()
-                if not file_path.endswith('.csv'):
-                    file_path += '.csv'
-                
-                # Build CSV content
-                csv_lines = []
-                
-                # Header row
-                header = ["Endpoint"] + list(self.replay_users_order)
-                csv_lines.append(",".join(['"%s"' % h.replace('"', '""') for h in header]))
-                
-                # Data rows
-                for endpoint in self.replay_endpoints_order:
-                    row = ['"%s"' % endpoint.replace('"', '""')]
-                    for user in self.replay_users_order:
-                        code_dict = self.replay_matrix.get(endpoint, {}).get(user, {})
-                        if code_dict:
-                            cell_value = ", ".join(["%s: %d" % (code, count) for code, count in sorted(code_dict.items())])
-                        else:
-                            cell_value = "0"
-                        row.append('"%s"' % cell_value.replace('"', '""'))
-                    csv_lines.append(",".join(row))
-                
-                # Write to file
-                with open(file_path, 'w') as f:
-                    f.write("\n".join(csv_lines))
-                
-                print("Replay matrix exported to CSV: %s" % file_path)
-        except Exception as e:
-            print("Error exporting replay matrix to CSV: %s" % str(e))
+            controller.message = messages[row]
+            request_viewer.setMessage(controller.message.getRequest(), True)
+            response_viewer.setMessage(controller.message.getResponse(), False)
 
-    def _on_export_replay_json(self, event=None):
-        """Export the replay matrix to JSON format."""
-        try:
-            if not self.replay_endpoints_order:
-                print("Nothing to export: run a replay first.")
-                return
-            # Show file chooser
-            chooser = JFileChooser()
-            chooser.setDialogTitle("Save Replay Matrix as JSON")
-            chooser.setFileFilter(FileNameExtensionFilter("JSON files", ["json"]))
-            result = chooser.showSaveDialog(self._panel)
-            
-            if result == JFileChooser.APPROVE_OPTION:
-                file_path = chooser.getSelectedFile().getAbsolutePath()
-                if not file_path.endswith('.json'):
-                    file_path += '.json'
-                
-                # Build JSON structure
-                export_data = {
-                    "jwt_field": self.jwt_user_field,
-                    "users": list(self.replay_users_order),
-                    "endpoints": []
-                }
-                
-                for endpoint in self.replay_endpoints_order:
-                    endpoint_data = {
-                        "endpoint": endpoint,
-                        "users": {}
-                    }
-                    for user in self.replay_users_order:
-                        code_dict = self.replay_matrix.get(endpoint, {}).get(user, {})
-                        if code_dict:
-                            endpoint_data["users"][user] = dict(code_dict)
-                        else:
-                            endpoint_data["users"][user] = {}
-                    export_data["endpoints"].append(endpoint_data)
-                
-                # Write to file
-                with open(file_path, 'w') as f:
-                    json.dump(export_data, f, indent=2)
-                
-                print("Replay matrix exported to JSON: %s" % file_path)
-        except Exception as e:
-            print("Error exporting replay matrix to JSON: %s" % str(e))
+        table.getSelectionModel().addListSelectionListener(on_select)
+        viewers = JSplitPane(JSplitPane.HORIZONTAL_SPLIT, request_viewer.getComponent(),
+                             response_viewer.getComponent())
+        viewers.setResizeWeight(0.5)
+        split = JSplitPane(JSplitPane.VERTICAL_SPLIT, JScrollPane(table), viewers)
+        split.setResizeWeight(0.3)
 
-    def _on_add_jwt_row(self, event):
-        """Add a new empty row to the JWT table."""
-        self.jwt_table_model.addRow(["", "", ""])
-
-    def _on_delete_jwt_row(self, table):
-        """Delete selected rows from the JWT table."""
-        rows = table.getSelectedRows()
-        if rows:
-            # Convert view indices to model indices
-            model_rows = [table.convertRowIndexToModel(row) for row in rows]
-            # Remove rows in reverse order to maintain indices
-            for row in sorted(model_rows, reverse=True):
-                self.jwt_table_model.removeRow(row)
-                # Update user_rows mapping
-                new_mapping = {}
-                for user, idx in self.jwt_table_model.user_rows.items():
-                    if idx < row:
-                        new_mapping[user] = idx
-                    elif idx > row:
-                        new_mapping[user] = idx - 1
-                self.jwt_table_model.user_rows = new_mapping
-
-    def _update_jwt_table(self, user, jwt):
-        """Update the JWT table with a new token."""
-        timestamp = java.util.Date().toString()
-        SwingUtilities.invokeLater(lambda: self.jwt_table_model.update_jwt(user, jwt, timestamp))
-
-class JwtMatrixContextMenu(IContextMenuFactory):
-    """Adds context menu to send requests to JWT Matrix"""
-    
-    def __init__(self, extender):
-        self.extender = extender
-
-    def createMenuItems(self, invocation):
-        menu_items = ArrayList()
-        
-        # Only show menu item for requests with JWT tokens
-        ctx = invocation.getSelectedMessages()
-        if ctx is None or len(ctx) == 0:
-            return menu_items
-
-        request = ctx[0]  # Get first selected request
-        analyzed_req = self.extender._helpers.analyzeRequest(request)
-        headers = analyzed_req.getHeaders()
-
-        # Check for JWT token in configured location
-        has_jwt = False
-        if self.extender.jwt_location_auth.isSelected():
-            # Check Authorization header
-            for header in headers:
-                if header.lower().startswith("authorization:") and "bearer" in header.lower():
-                    has_jwt = True
-                    break
-        else:
-            # Check Cookies
-            cookie_name = self.extender.cookie_name_field.getText().strip() or "jwt"
-            for header in headers:
-                if header.lower().startswith("cookie:"):
-                    cookies = header.split(":",1)[1].strip().split(";")
-                    for cookie in cookies:
-                        if "=" in cookie:
-                            name, value = cookie.split("=", 1)
-                            if name.strip() == cookie_name:
-                                has_jwt = True
-                                break
-                    if has_jwt:
-                        break 
-        
-        if has_jwt:
-            # Create action listener class instead of using lambda
-            class MenuItemAction(java.awt.event.ActionListener):
-                def __init__(self, context, matrix):
-                    self.context = context
-                    self.matrix = matrix
-                
-                def actionPerformed(self, e):
-                    self.matrix.send_to_matrix(self.context)
-            
-            menu_item = JMenuItem("Send to JWT Authorization Matrix")
-            menu_item.addActionListener(MenuItemAction(ctx, self))
-            menu_items.add(menu_item)
-        
-        return menu_items
-
-
-    def send_to_matrix(self, messages):
-        """Process selected message(s) and add to matrix"""
-        for message in messages:
-            try:
-                # Similar logic as processHttpMessage
-                analyzed_req = self.extender._helpers.analyzeRequest(message)
-                headers = analyzed_req.getHeaders()
-                url = analyzed_req.getUrl()
-                method = headers[0].split(' ')[0] if headers and len(headers)>0 else "GET"
-                endpoint = "%s %s" % (method, url.getPath() + (("?" + url.getQuery()) if url.getQuery() else ""))
-                
-                # Get response if available
-                response = message.getResponse()
-                if response is None:
-                    continue
-                    
-                analyzed_resp = self.extender._helpers.analyzeResponse(response)
-                response_code = str(analyzed_resp.getStatusCode())
-                
-                # Find JWT token based on configured location
-                token = None
-                if self.extender.jwt_location_auth.isSelected():
-                    # Look in Authorization header
-                    for h in headers:
-                        if h.lower().startswith("authorization:"):
-                            parts = h.split(":",1)[1].strip().split()
-                            if len(parts) >= 2 and parts[0].lower() == "bearer":
-                                token = parts[1].strip()
-                                break
-                else:
-                    # Look in Cookies
-                    cookie_name = self.extender.cookie_name_field.getText().strip() or "jwt"
-                    for h in headers:
-                        if h.lower().startswith("cookie:"):
-                            cookies = h.split(":",1)[1].strip().split(";")
-                            for cookie in cookies:
-                                if "=" in cookie:
-                                    name, value = cookie.split("=", 1)
-                                    if name.strip() == cookie_name:
-                                        token = value.strip()
-                                        break
-                            if token:
-                                break
-                
-                if not token:
-                    continue
-                    
-                user = self.extender._parse_jwt_get_field(token, self.extender.jwt_user_field)
-                if user is None:
-                    user = "<no-%s>" % self.extender.jwt_user_field
-                
-                # Add to matrix data structures
-                if endpoint not in self.extender.endpoints_order:
-                    self.extender.endpoints_order.append(endpoint)
-                if user not in self.extender.users_order:
-                    self.extender.users_order.append(user)
-                    
-                self.extender.matrix[endpoint][user][response_code] += 1
-                self.extender.request_details[endpoint][user][response_code].append(message)
-                
-                # Update UI
-                SwingUtilities.invokeLater(lambda: self.extender._update_table_model())
-                
-                print("Added request to JWT Matrix: %s" % endpoint)
-                
-            except Exception as e:
-                print("Error processing request for JWT Matrix: %s" % str(e))
-
-class RequestDetailsController(IMessageEditorController):
-    """Controller for the message editors in the request details dialog."""
-    def __init__(self, extender, requests):
-        self.extender = extender
-        self.requests = requests
-        self.current_message = None
-    
-    def setCurrentMessage(self, message):
-        self.current_message = message
-    
-    def getHttpService(self):
-        if self.current_message:
-            return self.current_message.getHttpService()
-        return None
-    
-    def getRequest(self):
-        if self.current_message:
-            return self.current_message.getRequest()
-        return None
-    
-    def getResponse(self):
-        if self.current_message:
-            return self.current_message.getResponse()
-        return None
-
-class JwtTableModel(DefaultTableModel):
-    def __init__(self):
-        super(JwtTableModel, self).__init__(
-            [], 
-            ["User", "JWT Token", "Last Seen"]
-        )
-        self.user_rows = {}  # user -> row index mapping
-    
-    def isCellEditable(self, row, col):
-        return col < 2  # Only User and JWT columns are editable
-    
-    def update_jwt(self, user, jwt, timestamp):
-        if user in self.user_rows:
-            row = self.user_rows[user]
-            self.setValueAt(jwt, row, 1)
-            self.setValueAt(timestamp, row, 2)
-        else:
-            row = self.getRowCount()
-            self.addRow([user, jwt, timestamp])
-            self.user_rows[user] = row
+        window = JFrame("%s (%d requests)" % (title, len(messages)))
+        window.setDefaultCloseOperation(WindowConstants.DISPOSE_ON_CLOSE)
+        window.add(split)
+        window.setSize(1000, 700)
+        window.setLocationRelativeTo(self._panel)
+        window.setVisible(True)
+        if messages:
+            table.setRowSelectionInterval(0, 0)
